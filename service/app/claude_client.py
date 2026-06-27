@@ -38,6 +38,12 @@ from .models import (
 
 MODEL = "claude-opus-4-8"
 
+# Reading ingestion (translate + align a whole book) is output-heavy and the
+# dominant cost driver, but it's a mechanical transform that a cheaper model
+# handles well — so it's configurable and defaults to Sonnet. The grammar
+# features (ask/assess/theory extraction) stay on the Opus MODEL above.
+READING_MODEL = os.environ.get("READING_MODEL", "claude-sonnet-4-6")
+
 # Pages per Claude call during ingestion. Smaller = more calls but bounded output.
 PAGE_WINDOW = int(os.environ.get("INGEST_PAGE_WINDOW", "8"))
 
@@ -495,7 +501,7 @@ _TRANSLATE_PROMPT = (
 def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
     """One streamed structured-output call returning the JSON text block."""
     with _client.messages.stream(
-        model=MODEL,
+        model=READING_MODEL,
         max_tokens=32000,
         output_config={"format": {"type": "json_schema", "schema": schema}},
         messages=[{"role": "user", "content": content}],
