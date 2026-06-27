@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+service/.env
+service/grammar.db
+
+# Node / Next.js
+node_modules/
+web/.next/
+web/out/
+web/.env.local
+
+# Misc
+.DS_Store
