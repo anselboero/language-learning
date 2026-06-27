@@ -172,14 +172,14 @@ export async function getBook(id: number): Promise<BookDetail> {
 export async function ingestBook(
   title: string,
   author: string,
-  english: File,
   german: File,
+  english?: File | null,
 ): Promise<Book> {
   const form = new FormData();
   form.append("title", title);
   form.append("author", author);
-  form.append("english", english);
   form.append("german", german);
+  if (english) form.append("english", english);
   return unwrap(
     await fetch(`${API_BASE}/reading/ingest`, { method: "POST", body: form }),
   );

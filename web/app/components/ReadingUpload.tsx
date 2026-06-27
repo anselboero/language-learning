@@ -8,13 +8,13 @@ export default function ReadingUpload() {
   const router = useRouter();
   const [title, setTitle] = useState("");
   const [author, setAuthor] = useState("");
-  const [english, setEnglish] = useState<File | null>(null);
   const [german, setGerman] = useState<File | null>(null);
+  const [english, setEnglish] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const ready = title.trim() && english && german;
+  const ready = title.trim() && german;
 
   async function handleUpload() {
     if (!ready) return;
@@ -22,12 +22,12 @@ export default function ReadingUpload() {
     setStatus(null);
     setError(null);
     try {
-      const book = await ingestBook(title.trim(), author.trim(), english!, german!);
+      const book = await ingestBook(title.trim(), author.trim(), german!, english);
       setStatus(`Done — "${book.title}" aligned into ${book.segment_count} segments (${book.vocab_size} weaveable words).`);
       setTitle("");
       setAuthor("");
-      setEnglish(null);
       setGerman(null);
+      setEnglish(null);
       router.refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Ingestion failed.");
@@ -40,9 +40,10 @@ export default function ReadingUpload() {
     <div className="card">
       <h2>Add a book</h2>
       <p className="muted">
-        Upload the same book as two plain-text files — the English version and its German
-        translation. Claude aligns them sentence by sentence and marks the weaveable
-        vocabulary.
+        Upload a German text (.txt). Claude writes a faithful, sentence-aligned English
+        scaffold and marks the weaveable vocabulary — so the woven words stay the author&apos;s
+        own German. Already have a faithful English translation? Add it as the optional second
+        file to align against that instead.
       </p>
       <input
         type="text"
@@ -60,20 +61,20 @@ export default function ReadingUpload() {
       />
       <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
         <label className="muted" style={{ fontSize: "0.9rem" }}>
-          English text (.txt)
-          <input
-            type="file"
-            accept=".txt,text/plain"
-            onChange={(e) => setEnglish(e.target.files?.[0] ?? null)}
-            style={{ display: "block", marginTop: "0.25rem" }}
-          />
-        </label>
-        <label className="muted" style={{ fontSize: "0.9rem" }}>
           German text (.txt)
           <input
             type="file"
             accept=".txt,text/plain"
             onChange={(e) => setGerman(e.target.files?.[0] ?? null)}
+            style={{ display: "block", marginTop: "0.25rem" }}
+          />
+        </label>
+        <label className="muted" style={{ fontSize: "0.9rem" }}>
+          English translation (.txt) — optional
+          <input
+            type="file"
+            accept=".txt,text/plain"
+            onChange={(e) => setEnglish(e.target.files?.[0] ?? null)}
             style={{ display: "block", marginTop: "0.25rem" }}
           />
         </label>
@@ -85,7 +86,7 @@ export default function ReadingUpload() {
       </div>
       {busy && (
         <p className="muted" style={{ marginBottom: 0 }}>
-          Claude is aligning the two texts — this can take a minute.
+          Claude is translating and aligning the text — this can take a minute.
         </p>
       )}
       {status && <p style={{ marginBottom: 0 }}>{status}</p>}

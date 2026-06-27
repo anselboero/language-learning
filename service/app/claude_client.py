@@ -467,6 +467,31 @@ _ALIGN_PROMPT = (
 )
 
 
+_TRANSLATE_PROMPT = (
+    "You are given a book in German. Produce an English diglot-weave scaffold for it.\n\n"
+    "Work through the German text in reading order, one segment at a time (a sentence, or "
+    "a couple of short sentences that must stay together). For every segment return:\n"
+    "- `german`: the German sentence(s), VERBATIM from the source — never reword the German.\n"
+    "- `chunks`: a faithful English translation of that segment, split into an ordered list "
+    "of chunks. Aim for natural but LITERAL English — one English sentence per German "
+    "sentence, minimal reordering — so the two line up closely. Concatenating every chunk's "
+    "`text` in order MUST reproduce your English sentence exactly, including spaces and "
+    "punctuation.\n\n"
+    "A chunk is either plain text or a weaveable word:\n"
+    "- Plain chunks carry connective words, punctuation, and whitespace; leave `de`/`gloss` null.\n"
+    "- Weaveable chunks are content words a learner should acquire — nouns, main verbs, "
+    "adjectives, common adverbs. For each, set `de` to the ACTUAL German word from this "
+    "segment's original sentence (not a re-translation) and `gloss` to a 1–3 word English meaning.\n"
+    "  • For a noun, group it with its preceding English article into one chunk "
+    "(`text` = 'the wolf') and give the German noun phrase with its real article and "
+    "capitalization in `de` (`de` = 'der Wolf'), inflected as it appears in the German.\n"
+    "  • For a verb or adjective, weave just the word, matching the German form actually used.\n"
+    "- Do NOT weave proper names, numbers, or pure function words on their own.\n\n"
+    "Every woven German word must be a real word from the original German segment, so the "
+    "learner only ever sees the author's own German."
+)
+
+
 def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
     """One streamed structured-output call returning the JSON text block."""
     with _client.messages.stream(
@@ -489,9 +514,17 @@ def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
     return text
 
 
+_LEMMA_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
+
+
 def _lemma_key(chunk: Any) -> str:
-    """Stable grouping key for a weaveable chunk: its meaning, lowercased."""
-    return (chunk.gloss or chunk.text).strip().lower()
+    """Stable grouping key for a weaveable chunk: its meaning, lowercased.
+
+    Strips a leading English article so 'grandmother' and 'the grandmother' count
+    as one word for frequency ranking, regardless of how the gloss was phrased.
+    """
+    key = (chunk.gloss or chunk.text).strip().lower()
+    return _LEMMA_ARTICLE.sub("", key)
 
 
 def _rank_segments(aligned: AlignedText) -> tuple[list[ReadingSegment], int]:
@@ -525,13 +558,30 @@ def _rank_segments(aligned: AlignedText) -> tuple[list[ReadingSegment], int]:
     return segments, len(ordered)
 
 
-def ingest_book(title: str, author: str, english_text: str, german_text: str) -> int:
-    """Align an English/German text pair into a stored diglot-weave book."""
-    content = [
-        {"type": "text", "text": _ALIGN_PROMPT},
-        {"type": "text", "text": f"=== ENGLISH TEXT ===\n\n{english_text}"},
-        {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
-    ]
+def ingest_book(
+    title: str,
+    author: str,
+    german_text: str,
+    english_text: str | None = None,
+) -> int:
+    """Ingest a German text into a stored diglot-weave book.
+
+    With only the German text, Claude generates a faithful, sentence-aligned English
+    scaffold (the recommended path — the woven words stay the author's own German, and
+    we avoid a published translation's literary license breaking the alignment). If a
+    faithful English translation is supplied, the two are aligned directly instead.
+    """
+    if english_text:
+        content = [
+            {"type": "text", "text": _ALIGN_PROMPT},
+            {"type": "text", "text": f"=== ENGLISH TEXT ===\n\n{english_text}"},
+            {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
+        ]
+    else:
+        content = [
+            {"type": "text", "text": _TRANSLATE_PROMPT},
+            {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
+        ]
     aligned = AlignedText.model_validate_json(_stream_text(content, _ALIGN_SCHEMA))
     if not aligned.segments:
         raise RuntimeError("No aligned segments were produced from these texts.")

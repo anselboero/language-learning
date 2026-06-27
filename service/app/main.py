@@ -8,7 +8,7 @@ Endpoints:
   GET  /sections/{number}         one section
   GET  /sections/{number}/exercises   practice exercises that drill this section
   POST /ask                       word / free-text lookup against the stored grammar
-  POST /reading/ingest            align an English+German text pair into a diglot book
+  POST /reading/ingest            turn a German text (English optional) into a diglot book
   GET  /reading/books             list ingested reading books
   GET  /reading/books/{id}        one book with its aligned, weave-ready segments
   DELETE /reading/books/{id}      remove a reading book
@@ -16,6 +16,8 @@ Endpoints:
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,15 +154,16 @@ async def _read_text(file: UploadFile) -> str:
 async def ingest_book(
     title: str = Form(...),
     author: str = Form(""),
-    english: UploadFile = File(...),
     german: UploadFile = File(...),
+    english: Optional[UploadFile] = File(None),
 ) -> Book:
-    english_text = await _read_text(english)
     german_text = await _read_text(german)
+    # English is optional: with German alone, Claude generates the aligned scaffold.
+    english_text = await _read_text(english) if english is not None else None
     try:
-        book_id = claude_client.ingest_book(title, author, english_text, german_text)
+        book_id = claude_client.ingest_book(title, author, german_text, english_text)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"Alignment failed: {exc}") from exc
+        raise HTTPException(502, f"Ingestion failed: {exc}") from exc
     book = db.get_book(book_id)
     if not book:
         raise HTTPException(500, "Book was ingested but could not be loaded.")
