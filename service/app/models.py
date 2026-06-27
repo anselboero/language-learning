@@ -1,0 +1,182 @@
+"""Pydantic models shared across the grammar service.
+
+The shapes mirror how Hammer's German Grammar and Usage is organized: numbered
+chapters containing hierarchically-numbered sections (e.g. ``12``, ``12.3``,
+``12.3.2``). Practice exercises (from Practising German Grammar) are keyed back
+to the Hammer's section they drill, so theory and practice join on the section
+number.
+
+These models double as the JSON-schema contract for Claude's structured-output
+extraction (``claude_client.py``) and as the API response shapes (``main.py``).
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+# --- Theory: chapters + sections --------------------------------------------
+
+
+class Chapter(BaseModel):
+    """A top-level chapter heading, e.g. '14  The modal auxiliaries'."""
+
+    number: int = Field(description="The chapter number, e.g. 14.")
+    title: str = Field(description="The chapter title, without the leading number.")
+
+
+class GrammarSectionData(BaseModel):
+    """One numbered grammar section as written in the book.
+
+    ``number`` is the book's own decimal section number and is the natural key.
+    Chapter / parent / level are derived from it at storage time, so the model
+    only needs to report the number accurately.
+    """
+
+    number: str = Field(
+        description="The book's decimal section number exactly as printed, e.g. '12.3.2'."
+    )
+    title: str = Field(description="The section heading, without the leading number.")
+    summary: str = Field(
+        description="One or two sentence plain-language summary of what this section teaches."
+    )
+    rule: str = Field(
+        description="The full rule and explanation in Markdown, preserving tables, "
+        "conjugations, and lists as they appear in the book."
+    )
+    examples: list[str] = Field(
+        default_factory=list,
+        description="Example sentences (with English glosses if the book gives them).",
+    )
+    keywords: list[str] = Field(
+        default_factory=list,
+        description="German words and grammatical terms this section governs, for word-to-rule lookup.",
+    )
+    cross_references: list[str] = Field(
+        default_factory=list,
+        description="Other section numbers this section explicitly refers to, e.g. ['2.1', '14.4'].",
+    )
+
+
+class ExtractedGrammar(BaseModel):
+    """What Claude returns for one window of pages from the theory book."""
+
+    chapters: list[Chapter] = Field(
+        default_factory=list,
+        description="Any chapter headings that begin on these pages.",
+    )
+    sections: list[GrammarSectionData] = Field(
+        default_factory=list,
+        description="Every grammar section whose text appears on these pages.",
+    )
+
+
+# --- Practice: exercises -----------------------------------------------------
+
+
+class ExerciseItem(BaseModel):
+    """One numbered item within an exercise."""
+
+    prompt: str = Field(description="The item itself, e.g. the noun 'Regen' or a sentence to complete.")
+    answer: Optional[str] = Field(
+        default=None,
+        description="The answer if an answer key is present, else null.",
+    )
+
+
+class ExerciseData(BaseModel):
+    """A whole workbook exercise — a unit that may span a range of GGU sections."""
+
+    chapter_number: int = Field(
+        description="The workbook chapter number (matches the Hammer's/GGU chapter), e.g. 1."
+    )
+    label: str = Field(description="The exercise number/label as printed, e.g. '5'.")
+    title: str = Field(description="The exercise title, e.g. 'Gender'.")
+    instructions: str = Field(description="What the learner is asked to do.")
+    section_refs: list[str] = Field(
+        default_factory=list,
+        description="The GGU section references this exercise practises, exactly as printed — "
+        "single numbers or ranges, e.g. ['1.1.1–1.1.9'] or ['12.3', '12.4'].",
+    )
+    items: list[ExerciseItem] = Field(
+        default_factory=list,
+        description="The individual items of the exercise, in order.",
+    )
+
+
+class ExtractedExercises(BaseModel):
+    """What Claude returns for one window of pages from the practice book."""
+
+    exercises: list[ExerciseData] = Field(default_factory=list)
+
+
+# --- Persisted / response shapes --------------------------------------------
+
+
+class GrammarSection(GrammarSectionData):
+    """A stored section: the extracted shape plus derived hierarchy fields."""
+
+    chapter_number: int
+    parent_number: Optional[str]
+    level: int
+
+
+class Exercise(ExerciseData):
+    id: int
+
+
+class ChapterWithSections(Chapter):
+    sections: list[GrammarSection] = Field(default_factory=list)
+
+
+# --- Ask ---------------------------------------------------------------------
+
+
+class AskRequest(BaseModel):
+    query: str = Field(description="A German word, phrase, or free-text grammar question.")
+
+
+class AskResponse(BaseModel):
+    answer: str = Field(description="Claude's explanation grounded in the stored grammar sections.")
+    section_numbers: list[str] = Field(
+        default_factory=list,
+        description="Section numbers Claude relied on, e.g. ['12.3', '14.4'].",
+    )
+
+
+# --- Assessing exercise answers ----------------------------------------------
+
+
+class SubmittedAnswer(BaseModel):
+    index: int = Field(description="0-based index of the exercise item this answer is for.")
+    answer: str = Field(description="The learner's answer for that item.")
+
+
+class AssessRequest(BaseModel):
+    answers: list[SubmittedAnswer]
+
+
+class ItemAssessment(BaseModel):
+    index: int = Field(description="0-based index of the item being graded.")
+    correct: bool = Field(description="Whether the learner's answer is correct.")
+    correct_answer: str = Field(description="The expected correct answer.")
+    comment: str = Field(
+        description="A short explanation — especially why a wrong answer is wrong. Empty if trivially correct."
+    )
+    section_numbers: list[str] = Field(
+        default_factory=list,
+        description="GGU section number(s) explaining this item's rule (from the provided sections only).",
+    )
+
+
+class AssessmentResult(BaseModel):
+    items: list[ItemAssessment] = Field(description="One assessment per submitted item, in order.")
+    summary: str = Field(
+        description="Brief overall feedback: how the learner did and which grammar areas to focus on."
+    )
+    review_sections: list[str] = Field(
+        default_factory=list,
+        description="Section numbers the learner should review, based on their mistakes.",
+    )
