@@ -13,11 +13,15 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <header className="site">
           <div className="inner">
-            <h1>📚 Language Learning</h1>
+            <h1>
+              <Link href="/" style={{ color: "inherit", textDecoration: "none" }}>
+                📚 Language Learning
+              </Link>
+            </h1>
             <nav>
               <Link href="/sections">Grammar</Link>
               <Link href="/reading">Reading</Link>
-              <Link href="/" className="upload-link">
+              <Link href="/upload" className="upload-link">
                 Upload
               </Link>
             </nav>

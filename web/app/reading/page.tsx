@@ -1,6 +1,5 @@
 import { listBooks, type Book } from "@/lib/api";
 import BookList from "../components/BookList";
-import ReadingUpload from "../components/ReadingUpload";
 
 export const dynamic = "force-dynamic";
 
@@ -23,9 +22,6 @@ export default async function ReadingPage() {
       </p>
       {error && <p className="error">{error}</p>}
       {!error && <BookList books={books} />}
-      <div style={{ marginTop: "1.5rem" }}>
-        <ReadingUpload />
-      </div>
     </>
   );
 }

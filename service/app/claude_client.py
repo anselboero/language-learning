@@ -44,6 +44,13 @@ MODEL = "claude-opus-4-8"
 # features (ask/assess/theory extraction) stay on the Opus MODEL above.
 READING_MODEL = os.environ.get("READING_MODEL", "claude-sonnet-4-6")
 
+# A whole book won't fit in one structured-output pass (the weave JSON is far
+# larger than the source text and hits the 32k output cap), so German-only
+# ingestion is split into chunks of roughly this many characters. Each chunk is
+# translated+aligned independently, then all segments are merged and ranked
+# globally. A chunk that still overflows is split in half and retried.
+READING_CHUNK_CHARS = int(os.environ.get("READING_CHUNK_CHARS", "6000"))
+
 # Pages per Claude call during ingestion. Smaller = more calls but bounded output.
 PAGE_WINDOW = int(os.environ.get("INGEST_PAGE_WINDOW", "8"))
 
@@ -505,6 +512,10 @@ _TRANSLATE_PROMPT = (
 )
 
 
+class _OutputLimitError(RuntimeError):
+    """Raised when a single ingestion call exhausts the output token budget."""
+
+
 def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
     """One streamed structured-output call returning the JSON text block."""
     with _client.messages.stream(
@@ -517,10 +528,7 @@ def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
     if message.stop_reason == "refusal":
         raise RuntimeError("Claude declined to process this text.")
     if message.stop_reason == "max_tokens":
-        raise RuntimeError(
-            "The book is too long to align in one pass (hit the 32k output limit). "
-            "Try a shorter text for now."
-        )
+        raise _OutputLimitError("output limit reached")
     text = next((b.text for b in message.content if b.type == "text"), None)
     if not text:
         raise RuntimeError("No alignment returned from Claude.")
@@ -571,6 +579,71 @@ def _rank_segments(aligned: AlignedText) -> tuple[list[ReadingSegment], int]:
     return segments, len(ordered)
 
 
+# --- text chunking for long books -------------------------------------------
+
+_PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _pack_chunks(text: str, budget: int) -> list[str]:
+    """Greedily group paragraphs into chunks of about `budget` characters."""
+    units = [p.strip() for p in _PARAGRAPH_SPLIT.split(text) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        if current and len(current) + len(unit) + 2 > budget:
+            chunks.append(current)
+            current = unit
+        else:
+            current = f"{current}\n\n{unit}" if current else unit
+    if current:
+        chunks.append(current)
+    return chunks or ([text.strip()] if text.strip() else [])
+
+
+def _halve(text: str) -> list[str]:
+    """Split a too-big chunk near its midpoint, preferring a clean boundary."""
+    for splitter in (_PARAGRAPH_SPLIT, _SENTENCE_SPLIT):
+        parts = splitter.split(text)
+        if len(parts) > 1:
+            joiner = "\n\n" if splitter is _PARAGRAPH_SPLIT else " "
+            # Split where the running character count first crosses the midpoint,
+            # so the two halves are balanced by length rather than by part count.
+            target, acc, mid = len(text) / 2, 0, 1
+            for i, part in enumerate(parts):
+                acc += len(part)
+                if acc >= target:
+                    mid = max(1, i)
+                    break
+            left = joiner.join(parts[:mid]).strip()
+            right = joiner.join(parts[mid:]).strip()
+            if left and right:
+                return [left, right]
+    midpoint = len(text) // 2
+    return [text[:midpoint].strip(), text[midpoint:].strip()]
+
+
+def _translate_chunk(german: str) -> list[AlignedSegmentData]:
+    """Translate+align one chunk; split and retry if it overflows the output cap."""
+    content = [
+        {"type": "text", "text": _TRANSLATE_PROMPT},
+        {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german}"},
+    ]
+    try:
+        return AlignedText.model_validate_json(_stream_text(content, _ALIGN_SCHEMA)).segments
+    except _OutputLimitError:
+        halves = _halve(german)
+        if len(halves) < 2 or not all(halves):
+            raise RuntimeError(
+                "A single paragraph is too large to align even after splitting. "
+                "Lower READING_CHUNK_CHARS and re-ingest."
+            )
+        out: list[AlignedSegmentData] = []
+        for half in halves:
+            out.extend(_translate_chunk(half))
+        return out
+
+
 def ingest_book(
     title: str,
     author: str,
@@ -581,8 +654,10 @@ def ingest_book(
 
     With only the German text, Claude generates a faithful, sentence-aligned English
     scaffold (the recommended path — the woven words stay the author's own German, and
-    we avoid a published translation's literary license breaking the alignment). If a
-    faithful English translation is supplied, the two are aligned directly instead.
+    we avoid a published translation's literary license breaking the alignment). The
+    German is split into character-bounded chunks so a full-length book fits, then all
+    segments are merged and ranked globally. If a faithful English translation is
+    supplied, the two are aligned directly in one pass instead.
     """
     if english_text:
         content = [
@@ -590,17 +665,26 @@ def ingest_book(
             {"type": "text", "text": f"=== ENGLISH TEXT ===\n\n{english_text}"},
             {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
         ]
+        try:
+            segments = AlignedText.model_validate_json(
+                _stream_text(content, _ALIGN_SCHEMA)
+            ).segments
+        except _OutputLimitError as exc:
+            raise RuntimeError(
+                "This English+German pair is too long to align in one pass. Upload the "
+                "German text on its own to use chunked ingestion."
+            ) from exc
     else:
-        content = [
-            {"type": "text", "text": _TRANSLATE_PROMPT},
-            {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
-        ]
-    aligned = AlignedText.model_validate_json(_stream_text(content, _ALIGN_SCHEMA))
-    if not aligned.segments:
+        segments = []
+        for chunk in _pack_chunks(german_text, READING_CHUNK_CHARS):
+            segments.extend(_translate_chunk(chunk))
+
+    if not segments:
         raise RuntimeError("No aligned segments were produced from these texts.")
 
-    segments, vocab_size = _rank_segments(aligned)
+    merged = AlignedText(segments=segments)
+    stored_segments, vocab_size = _rank_segments(merged)
 
     from . import db
 
-    return db.create_book(title, author, vocab_size, segments)
+    return db.create_book(title, author, vocab_size, stored_segments)

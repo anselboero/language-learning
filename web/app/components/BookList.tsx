@@ -26,7 +26,12 @@ export default function BookList({ books }: { books: Book[] }) {
   }
 
   if (books.length === 0) {
-    return <p className="muted">No books yet. Add one below to start reading.</p>;
+    return (
+      <p className="muted">
+        No books yet. Add one on the <Link href="/upload">Upload</Link> page to start
+        reading.
+      </p>
+    );
   }
 
   return (

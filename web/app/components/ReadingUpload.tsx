@@ -86,7 +86,8 @@ export default function ReadingUpload() {
       </div>
       {busy && (
         <p className="muted" style={{ marginBottom: 0 }}>
-          Claude is translating and aligning the text — this can take a minute.
+          Claude is translating and aligning the text — a short story takes a minute,
+          a full book several.
         </p>
       )}
       {status && <p style={{ marginBottom: 0 }}>{status}</p>}
