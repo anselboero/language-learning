@@ -57,6 +57,34 @@ export interface AssessmentResult {
   review_sections: string[];
 }
 
+// --- reading: diglot-weave books -------------------------------------------
+
+export interface WeaveChunk {
+  text: string; // verbatim English surface text
+  de: string | null; // German form to weave in, or null if not weaveable
+  gloss: string | null; // short English meaning shown on tap
+  rank: number | null; // 0-based frequency rank (0 = most frequent); null if not weaveable
+}
+
+export interface ReadingSegment {
+  seq: number;
+  english: string;
+  german: string;
+  chunks: WeaveChunk[];
+}
+
+export interface Book {
+  id: number;
+  title: string;
+  author: string;
+  vocab_size: number;
+  segment_count: number;
+}
+
+export interface BookDetail extends Book {
+  segments: ReadingSegment[];
+}
+
 async function unwrap<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
@@ -128,5 +156,37 @@ export async function askClaude(query: string): Promise<AskResponse> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query }),
     }),
+  );
+}
+
+export async function listBooks(): Promise<Book[]> {
+  return unwrap(await fetch(`${API_BASE}/reading/books`, { cache: "no-store" }));
+}
+
+export async function getBook(id: number): Promise<BookDetail> {
+  return unwrap(
+    await fetch(`${API_BASE}/reading/books/${id}`, { cache: "no-store" }),
+  );
+}
+
+export async function ingestBook(
+  title: string,
+  author: string,
+  english: File,
+  german: File,
+): Promise<Book> {
+  const form = new FormData();
+  form.append("title", title);
+  form.append("author", author);
+  form.append("english", english);
+  form.append("german", german);
+  return unwrap(
+    await fetch(`${API_BASE}/reading/ingest`, { method: "POST", body: form }),
+  );
+}
+
+export async function deleteBook(id: number): Promise<void> {
+  await unwrap(
+    await fetch(`${API_BASE}/reading/books/${id}`, { method: "DELETE" }),
   );
 }

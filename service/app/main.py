@@ -8,12 +8,16 @@ Endpoints:
   GET  /sections/{number}         one section
   GET  /sections/{number}/exercises   practice exercises that drill this section
   POST /ask                       word / free-text lookup against the stored grammar
+  POST /reading/ingest            align an English+German text pair into a diglot book
+  GET  /reading/books             list ingested reading books
+  GET  /reading/books/{id}        one book with its aligned, weave-ready segments
+  DELETE /reading/books/{id}      remove a reading book
   GET  /health                    liveness probe
 """
 
 from __future__ import annotations
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import claude_client, db
@@ -22,6 +26,8 @@ from .models import (
     AskResponse,
     AssessmentResult,
     AssessRequest,
+    Book,
+    BookDetail,
     ChapterWithSections,
     Exercise,
     GrammarSection,
@@ -121,3 +127,61 @@ def ask(req: AskRequest) -> AskResponse:
         return claude_client.ask(req.query, db.list_sections())
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Lookup failed: {exc}") from exc
+
+
+# --- reading -----------------------------------------------------------------
+
+
+async def _read_text(file: UploadFile) -> str:
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Uploaded file is empty.")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = data.decode("latin-1")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, "Could not decode the text file.") from exc
+    if not text.strip():
+        raise HTTPException(400, "Uploaded file has no text.")
+    return text
+
+
+@app.post("/reading/ingest", response_model=Book)
+async def ingest_book(
+    title: str = Form(...),
+    author: str = Form(""),
+    english: UploadFile = File(...),
+    german: UploadFile = File(...),
+) -> Book:
+    english_text = await _read_text(english)
+    german_text = await _read_text(german)
+    try:
+        book_id = claude_client.ingest_book(title, author, english_text, german_text)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Alignment failed: {exc}") from exc
+    book = db.get_book(book_id)
+    if not book:
+        raise HTTPException(500, "Book was ingested but could not be loaded.")
+    return Book(**book.model_dump(exclude={"segments"}))
+
+
+@app.get("/reading/books", response_model=list[Book])
+def reading_books() -> list[Book]:
+    return db.list_books()
+
+
+@app.get("/reading/books/{book_id}", response_model=BookDetail)
+def reading_book(book_id: int) -> BookDetail:
+    book = db.get_book(book_id)
+    if not book:
+        raise HTTPException(404, "Book not found.")
+    return book
+
+
+@app.delete("/reading/books/{book_id}")
+def delete_reading_book(book_id: int) -> dict[str, bool]:
+    if not db.delete_book(book_id):
+        raise HTTPException(404, "Book not found.")
+    return {"deleted": True}

@@ -242,3 +242,77 @@ textarea {
   opacity: 0.45;
   cursor: not-allowed;
 }
+
+/* --- reading: diglot weave ------------------------------------------------ */
+
+.density-card {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.density-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.density-row label {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.density-row input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+.density-pct {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  font-weight: 600;
+  min-width: 3ch;
+  text-align: right;
+}
+
+.reader-text {
+  font-size: 1.15rem;
+  line-height: 1.85;
+}
+.reader-text p {
+  margin: 0 0 1rem;
+}
+
+.woven {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 0.15rem;
+  cursor: pointer;
+  font-weight: 500;
+}
+.woven:hover {
+  text-decoration: underline;
+}
+
+.inspector {
+  position: sticky;
+  bottom: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  padding: 1rem 1.2rem;
+  margin-top: 1.5rem;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.08);
+}
+.inspector-close {
+  position: absolute;
+  top: 0.6rem;
+  right: 0.7rem;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 0.2rem;
+}
+.inspector-head {
+  margin: 0 0 0.3rem;
+  font-size: 1.2rem;
+}

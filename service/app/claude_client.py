@@ -21,6 +21,7 @@ import anthropic
 from pypdf import PdfReader, PdfWriter
 
 from .models import (
+    AlignedText,
     AskResponse,
     AssessmentResult,
     Chapter,
@@ -30,6 +31,8 @@ from .models import (
     ExtractedGrammar,
     GrammarSection,
     GrammarSectionData,
+    ReadingSegment,
+    StoredChunk,
     SubmittedAnswer,
 )
 
@@ -430,3 +433,111 @@ def assess(
     if not text:
         raise RuntimeError("No assessment returned from Claude.")
     return AssessmentResult.model_validate(json.loads(text))
+
+
+# --- reading: diglot-weave alignment -----------------------------------------
+
+_ALIGN_SCHEMA = _strict_schema(AlignedText)
+
+_ALIGN_PROMPT = (
+    "You are given the SAME book in two languages: an English text and its German "
+    "translation. Align them into sentence-level segments in reading order, so that "
+    "each segment pairs one English sentence (or a couple of short ones that must stay "
+    "together) with the German sentence(s) that translate it.\n\n"
+    "For every segment return:\n"
+    "- `german`: the matching German sentence(s), verbatim from the German text.\n"
+    "- `chunks`: the ENGLISH sentence split into an ordered list of chunks. "
+    "Concatenating every chunk's `text` in order MUST reproduce the English sentence "
+    "exactly, including all spaces and punctuation.\n\n"
+    "A chunk is either plain text or a weaveable word:\n"
+    "- Plain chunks carry the connective text, punctuation, and whitespace; leave their "
+    "`de` and `gloss` null.\n"
+    "- Weaveable chunks are content words a learner should acquire — nouns, main verbs, "
+    "adjectives, and common adverbs. For each, set `de` to the contextually-correct "
+    "German form and `gloss` to a 1–3 word English meaning.\n"
+    "  • For a noun, GROUP it with its preceding article/determiner into one chunk "
+    "(`text` = 'the wolf') and give the full German noun phrase with the correct article "
+    "and capitalization in `de` (`de` = 'der Wolf').\n"
+    "  • For a verb or adjective, weave just the word, inflected to match the German "
+    "translation as it actually appears.\n"
+    "- Do NOT weave proper names, numbers, or pure function words on their own.\n\n"
+    "Keep the original English wording — never paraphrase. If a German sentence has no "
+    "English counterpart (or vice versa), attach it to the nearest segment rather than "
+    "inventing text."
+)
+
+
+def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
+    """One streamed structured-output call returning the JSON text block."""
+    with _client.messages.stream(
+        model=MODEL,
+        max_tokens=32000,
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+        messages=[{"role": "user", "content": content}],
+    ) as stream:
+        message = stream.get_final_message()
+    if message.stop_reason == "refusal":
+        raise RuntimeError("Claude declined to process this text.")
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError(
+            "The book is too long to align in one pass (hit the 32k output limit). "
+            "Try a shorter text for now."
+        )
+    text = next((b.text for b in message.content if b.type == "text"), None)
+    if not text:
+        raise RuntimeError("No alignment returned from Claude.")
+    return text
+
+
+def _lemma_key(chunk: Any) -> str:
+    """Stable grouping key for a weaveable chunk: its meaning, lowercased."""
+    return (chunk.gloss or chunk.text).strip().lower()
+
+
+def _rank_segments(aligned: AlignedText) -> tuple[list[ReadingSegment], int]:
+    """Assign each weaveable chunk a global frequency rank (0 = most frequent).
+
+    Words that recur most across the book get the lowest ranks, so they are woven
+    in first as the density rises — maximizing exposure to high-frequency vocabulary.
+    """
+    counts: dict[str, int] = {}
+    for seg in aligned.segments:
+        for chunk in seg.chunks:
+            if chunk.de:
+                counts[_lemma_key(chunk)] = counts.get(_lemma_key(chunk), 0) + 1
+
+    ordered = sorted(counts, key=lambda k: (-counts[k], k))
+    rank_of = {key: i for i, key in enumerate(ordered)}
+
+    segments: list[ReadingSegment] = []
+    for i, seg in enumerate(aligned.segments):
+        stored = [
+            StoredChunk(
+                text=chunk.text,
+                de=chunk.de,
+                gloss=chunk.gloss,
+                rank=rank_of[_lemma_key(chunk)] if chunk.de else None,
+            )
+            for chunk in seg.chunks
+        ]
+        english = "".join(chunk.text for chunk in seg.chunks)
+        segments.append(ReadingSegment(seq=i, english=english, german=seg.german, chunks=stored))
+    return segments, len(ordered)
+
+
+def ingest_book(title: str, author: str, english_text: str, german_text: str) -> int:
+    """Align an English/German text pair into a stored diglot-weave book."""
+    content = [
+        {"type": "text", "text": _ALIGN_PROMPT},
+        {"type": "text", "text": f"=== ENGLISH TEXT ===\n\n{english_text}"},
+        {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
+    ]
+    aligned = AlignedText.model_validate_json(_stream_text(content, _ALIGN_SCHEMA))
+    if not aligned.segments:
+        raise RuntimeError("No aligned segments were produced from these texts.")
+
+    segments, vocab_size = _rank_segments(aligned)
+
+    from . import db
+
+    return db.create_book(title, author, vocab_size, segments)

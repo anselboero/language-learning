@@ -14,12 +14,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from .models import (
+    Book,
+    BookDetail,
     Chapter,
     ChapterWithSections,
     Exercise,
     ExerciseData,
     ExerciseItem,
     GrammarSection,
+    ReadingSegment,
+    StoredChunk,
 )
 
 DB_PATH = os.environ.get(
@@ -71,8 +75,26 @@ def init_db() -> None:
                 items          TEXT NOT NULL            -- JSON list of {prompt, answer}
             );
 
+            CREATE TABLE IF NOT EXISTS books (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL,
+                author      TEXT NOT NULL,
+                vocab_size  INTEGER NOT NULL          -- distinct weaveable lemmas
+            );
+
+            CREATE TABLE IF NOT EXISTS reading_segments (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id  INTEGER NOT NULL,
+                seq      INTEGER NOT NULL,             -- order within the book
+                english  TEXT NOT NULL,
+                german   TEXT NOT NULL,
+                chunks   TEXT NOT NULL,                -- JSON list of {text, de, gloss, rank}
+                FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sections_chapter ON sections(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_exercises_chapter ON exercises(chapter_number);
+            CREATE INDEX IF NOT EXISTS idx_segments_book ON reading_segments(book_id);
             """
         )
 
@@ -263,3 +285,92 @@ def get_sections_for_exercise(refs: list[str]) -> list[GrammarSection]:
         for s in list_sections()
         if any(_ref_covers(ref, s.number) for ref in refs)
     ]
+
+
+# --- reading: books + aligned segments ---------------------------------------
+
+
+def create_book(
+    title: str, author: str, vocab_size: int, segments: list[ReadingSegment]
+) -> int:
+    """Store a freshly-aligned book and its segments; returns the new book id."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO books (title, author, vocab_size) VALUES (?, ?, ?)",
+            (title, author, vocab_size),
+        )
+        book_id = int(cur.lastrowid)
+        for seg in segments:
+            conn.execute(
+                """
+                INSERT INTO reading_segments (book_id, seq, english, german, chunks)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    book_id,
+                    seg.seq,
+                    seg.english,
+                    seg.german,
+                    json.dumps([c.model_dump() for c in seg.chunks]),
+                ),
+            )
+    return book_id
+
+
+def list_books() -> list[Book]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id, b.title, b.author, b.vocab_size,
+                   COUNT(s.id) AS segment_count
+            FROM books b
+            LEFT JOIN reading_segments s ON s.book_id = b.id
+            GROUP BY b.id
+            ORDER BY b.id
+            """
+        ).fetchall()
+    return [
+        Book(
+            id=r["id"],
+            title=r["title"],
+            author=r["author"],
+            vocab_size=r["vocab_size"],
+            segment_count=r["segment_count"],
+        )
+        for r in rows
+    ]
+
+
+def get_book(book_id: int) -> BookDetail | None:
+    with _connect() as conn:
+        book = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+        if not book:
+            return None
+        seg_rows = conn.execute(
+            "SELECT * FROM reading_segments WHERE book_id = ? ORDER BY seq",
+            (book_id,),
+        ).fetchall()
+    segments = [
+        ReadingSegment(
+            seq=r["seq"],
+            english=r["english"],
+            german=r["german"],
+            chunks=[StoredChunk(**c) for c in json.loads(r["chunks"])],
+        )
+        for r in seg_rows
+    ]
+    return BookDetail(
+        id=book["id"],
+        title=book["title"],
+        author=book["author"],
+        vocab_size=book["vocab_size"],
+        segment_count=len(segments),
+        segments=segments,
+    )
+
+
+def delete_book(book_id: int) -> bool:
+    with _connect() as conn:
+        conn.execute("DELETE FROM reading_segments WHERE book_id = ?", (book_id,))
+        cur = conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
+    return cur.rowcount > 0
