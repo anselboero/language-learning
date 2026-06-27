@@ -14,6 +14,7 @@ import json
 import os
 import re
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any
 
@@ -50,6 +51,10 @@ READING_MODEL = os.environ.get("READING_MODEL", "claude-sonnet-4-6")
 # translated+aligned independently, then all segments are merged and ranked
 # globally. A chunk that still overflows is split in half and retried.
 READING_CHUNK_CHARS = int(os.environ.get("READING_CHUNK_CHARS", "6000"))
+
+# Chunks are independent, so they're aligned concurrently to cut wall-clock on
+# long books. Kept modest to stay within the model's rate limits.
+READING_CONCURRENCY = int(os.environ.get("READING_CONCURRENCY", "6"))
 
 # Pages per Claude call during ingestion. Smaller = more calls but bounded output.
 PAGE_WINDOW = int(os.environ.get("INGEST_PAGE_WINDOW", "8"))
@@ -675,9 +680,14 @@ def ingest_book(
                 "German text on its own to use chunked ingestion."
             ) from exc
     else:
-        segments = []
-        for chunk in _pack_chunks(german_text, READING_CHUNK_CHARS):
-            segments.extend(_translate_chunk(chunk))
+        chunks = _pack_chunks(german_text, READING_CHUNK_CHARS)
+        if not chunks:
+            raise RuntimeError("The text appears to be empty.")
+        # Chunks are independent; align them concurrently. ThreadPoolExecutor.map
+        # preserves input order, so the merged segments stay in reading order.
+        with ThreadPoolExecutor(max_workers=min(READING_CONCURRENCY, len(chunks))) as pool:
+            parts = list(pool.map(_translate_chunk, chunks))
+        segments = [seg for part in parts for seg in part]
 
     if not segments:
         raise RuntimeError("No aligned segments were produced from these texts.")
