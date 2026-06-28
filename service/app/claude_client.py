@@ -19,6 +19,7 @@ from io import BytesIO
 from typing import Any
 
 import anthropic
+from pydantic import ValidationError
 from pypdf import PdfReader, PdfWriter
 
 from .models import (
@@ -640,14 +641,29 @@ def _halve(text: str) -> list[str]:
     return [text[:midpoint].strip(), text[midpoint:].strip()]
 
 
-def _translate_chunk(german: str) -> list[AlignedSegmentData]:
-    """Translate+align one chunk; split and retry if it overflows the output cap."""
+# Structured output is almost always valid JSON, but the model very occasionally
+# emits a stray trailing comma; repair that before giving up, and otherwise
+# regenerate the chunk a couple of times rather than failing the whole book.
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+_PARSE_RETRIES = 2
+
+
+def _parse_aligned(raw: str) -> AlignedText:
+    """Parse alignment JSON, repairing a stray trailing comma if present."""
+    try:
+        return AlignedText.model_validate_json(raw)
+    except ValidationError:
+        return AlignedText.model_validate_json(_TRAILING_COMMA.sub(r"\1", raw))
+
+
+def _translate_chunk(german: str, attempt: int = 0) -> list[AlignedSegmentData]:
+    """Translate+align one chunk; split on overflow, regenerate on bad JSON."""
     content = [
         {"type": "text", "text": _TRANSLATE_PROMPT},
         {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german}"},
     ]
     try:
-        return AlignedText.model_validate_json(_stream_text(content, _ALIGN_SCHEMA)).segments
+        raw = _stream_text(content, _ALIGN_SCHEMA)
     except _OutputLimitError:
         halves = _halve(german)
         if len(halves) < 2 or not all(halves):
@@ -659,6 +675,15 @@ def _translate_chunk(german: str) -> list[AlignedSegmentData]:
         for half in halves:
             out.extend(_translate_chunk(half))
         return out
+
+    try:
+        return _parse_aligned(raw).segments
+    except ValidationError:
+        if attempt < _PARSE_RETRIES:
+            return _translate_chunk(german, attempt + 1)
+        raise RuntimeError(
+            "Claude returned malformed alignment JSON for a chunk after retries."
+        )
 
 
 def ingest_book(
@@ -683,14 +708,13 @@ def ingest_book(
             {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
         ]
         try:
-            segments = AlignedText.model_validate_json(
-                _stream_text(content, _ALIGN_SCHEMA)
-            ).segments
+            raw = _stream_text(content, _ALIGN_SCHEMA)
         except _OutputLimitError as exc:
             raise RuntimeError(
                 "This English+German pair is too long to align in one pass. Upload the "
                 "German text on its own to use chunked ingestion."
             ) from exc
+        segments = _parse_aligned(raw).segments
     else:
         chunks = _pack_chunks(german_text, READING_CHUNK_CHARS)
         if not chunks:
