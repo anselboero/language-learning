@@ -28,6 +28,9 @@ from .models import (
     Flashcard,
     FlashcardData,
     GrammarSection,
+    ListeningClip,
+    ListeningClipData,
+    ListeningSource,
     ReadingChapter,
     ReadingSegment,
 )
@@ -127,11 +130,40 @@ def init_db() -> None:
                 FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS listening_sources (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL,
+                video_path  TEXT NOT NULL,            -- absolute path to local media
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS listening_clips (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id     INTEGER NOT NULL,
+                seq           INTEGER NOT NULL,         -- order within the source
+                start_ms      INTEGER NOT NULL,         -- clip bounds within the media
+                end_ms        INTEGER NOT NULL,
+                transcript_de TEXT NOT NULL,            -- verbatim German from the SRT
+                transcript_en TEXT NOT NULL,            -- English translation
+                difficulty    TEXT NOT NULL,            -- CEFR level, e.g. 'B1'
+                topic         TEXT NOT NULL,            -- short topic label
+                due           TEXT NOT NULL,            -- ISO date next due (SM-2)
+                interval      REAL NOT NULL,            -- days
+                ease          REAL NOT NULL,            -- SM-2 ease factor
+                reps          INTEGER NOT NULL,
+                lapses        INTEGER NOT NULL,
+                last_reviewed TEXT,                     -- ISO datetime or NULL
+                created_at    TEXT NOT NULL,
+                FOREIGN KEY (source_id) REFERENCES listening_sources(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sections_chapter ON sections(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_exercises_chapter ON exercises(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_segments_book ON reading_segments(book_id);
             CREATE INDEX IF NOT EXISTS idx_chapters_book ON reading_chapters(book_id);
             CREATE INDEX IF NOT EXISTS idx_flashcards_due ON flashcards(due);
+            CREATE INDEX IF NOT EXISTS idx_clips_source ON listening_clips(source_id);
+            CREATE INDEX IF NOT EXISTS idx_clips_due ON listening_clips(due);
             """
         )
         # Drop the legacy diglot-weave columns from a pre-existing DB. The German and
@@ -646,4 +678,203 @@ def update_flashcard(card_id: int, card: FlashcardData) -> Flashcard | None:
 def delete_flashcard(card_id: int) -> bool:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM flashcards WHERE id = ?", (card_id,))
+    return cur.rowcount > 0
+
+
+# --- listening: sources + dictation clips ------------------------------------
+
+
+def _row_to_clip(row: sqlite3.Row) -> ListeningClip:
+    return ListeningClip(
+        id=row["id"],
+        source_id=row["source_id"],
+        seq=row["seq"],
+        start_ms=row["start_ms"],
+        end_ms=row["end_ms"],
+        transcript_de=row["transcript_de"],
+        transcript_en=row["transcript_en"],
+        difficulty=row["difficulty"],
+        topic=row["topic"],
+        due=row["due"],
+        interval=row["interval"],
+        ease=row["ease"],
+        reps=row["reps"],
+        lapses=row["lapses"],
+        last_reviewed=row["last_reviewed"],
+        created_at=row["created_at"],
+    )
+
+
+def create_listening_source(
+    title: str, video_path: str, clips: list[ListeningClipData]
+) -> ListeningSource:
+    """Store a source and its curated clips, each on a fresh SM-2 schedule."""
+    created = srs.now_iso()
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO listening_sources (title, video_path, created_at) VALUES (?, ?, ?)",
+            (title, video_path, created),
+        )
+        source_id = int(cur.lastrowid)
+        for clip in clips:
+            sched = srs.initial()
+            conn.execute(
+                """
+                INSERT INTO listening_clips
+                    (source_id, seq, start_ms, end_ms, transcript_de, transcript_en,
+                     difficulty, topic, due, interval, ease, reps, lapses, last_reviewed, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    clip.seq,
+                    clip.start_ms,
+                    clip.end_ms,
+                    clip.transcript_de,
+                    clip.transcript_en,
+                    clip.difficulty,
+                    clip.topic,
+                    sched.due,
+                    sched.interval,
+                    sched.ease,
+                    sched.reps,
+                    sched.lapses,
+                    None,
+                    created,
+                ),
+            )
+    source = get_listening_source(source_id)
+    assert source is not None  # just inserted
+    return source
+
+
+def list_listening_sources() -> list[ListeningSource]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.id, s.title, s.video_path, s.created_at,
+                   (SELECT COUNT(*) FROM listening_clips c WHERE c.source_id = s.id) AS clip_count
+            FROM listening_sources s
+            ORDER BY s.id DESC
+            """
+        ).fetchall()
+    return [
+        ListeningSource(
+            id=r["id"],
+            title=r["title"],
+            video_path=r["video_path"],
+            clip_count=r["clip_count"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+def get_listening_source(source_id: int) -> ListeningSource | None:
+    with _connect() as conn:
+        r = conn.execute(
+            """
+            SELECT s.id, s.title, s.video_path, s.created_at,
+                   (SELECT COUNT(*) FROM listening_clips c WHERE c.source_id = s.id) AS clip_count
+            FROM listening_sources s WHERE s.id = ?
+            """,
+            (source_id,),
+        ).fetchone()
+    if not r:
+        return None
+    return ListeningSource(
+        id=r["id"],
+        title=r["title"],
+        video_path=r["video_path"],
+        clip_count=r["clip_count"],
+        created_at=r["created_at"],
+    )
+
+
+def delete_listening_source(source_id: int) -> bool:
+    with _connect() as conn:
+        conn.execute("DELETE FROM listening_clips WHERE source_id = ?", (source_id,))
+        cur = conn.execute("DELETE FROM listening_sources WHERE id = ?", (source_id,))
+    return cur.rowcount > 0
+
+
+def list_clips_for_source(source_id: int) -> list[ListeningClip]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM listening_clips WHERE source_id = ? ORDER BY seq",
+            (source_id,),
+        ).fetchall()
+    return [_row_to_clip(r) for r in rows]
+
+
+def list_clips() -> list[ListeningClip]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM listening_clips ORDER BY created_at DESC, seq").fetchall()
+    return [_row_to_clip(r) for r in rows]
+
+
+def list_due_clips(today_iso: str) -> list[ListeningClip]:
+    """Listening clips due on or before today, oldest-due first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM listening_clips WHERE due <= ? ORDER BY due, id",
+            (today_iso,),
+        ).fetchall()
+    return [_row_to_clip(r) for r in rows]
+
+
+def get_listening_clip(clip_id: int) -> ListeningClip | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM listening_clips WHERE id = ?", (clip_id,)).fetchone()
+    return _row_to_clip(row) if row else None
+
+
+def review_listening_clip(clip_id: int, rating: str) -> ListeningClip | None:
+    """Apply a review grade to a clip and persist its new SM-2 state."""
+    clip = get_listening_clip(clip_id)
+    if not clip:
+        return None
+    sched = srs.review(rating, clip.interval, clip.ease, clip.reps, clip.lapses)
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE listening_clips
+               SET due = ?, interval = ?, ease = ?, reps = ?, lapses = ?, last_reviewed = ?
+             WHERE id = ?
+            """,
+            (sched.due, sched.interval, sched.ease, sched.reps, sched.lapses, srs.now_iso(), clip_id),
+        )
+        row = conn.execute("SELECT * FROM listening_clips WHERE id = ?", (clip_id,)).fetchone()
+    return _row_to_clip(row)
+
+
+def update_listening_clip(clip_id: int, data: ListeningClipData) -> ListeningClip | None:
+    """Overwrite a clip's editable content, leaving its SM-2 schedule untouched."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE listening_clips
+               SET start_ms = ?, end_ms = ?, transcript_de = ?, transcript_en = ?,
+                   difficulty = ?, topic = ?
+             WHERE id = ?
+            """,
+            (
+                data.start_ms,
+                data.end_ms,
+                data.transcript_de,
+                data.transcript_en,
+                data.difficulty,
+                data.topic,
+                clip_id,
+            ),
+        )
+        if cur.rowcount == 0:
+            return None
+        row = conn.execute("SELECT * FROM listening_clips WHERE id = ?", (clip_id,)).fetchone()
+    return _row_to_clip(row)
+
+
+def delete_listening_clip(clip_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM listening_clips WHERE id = ?", (clip_id,))
     return cur.rowcount > 0

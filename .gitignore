@@ -5,6 +5,7 @@ __pycache__/
 venv/
 service/.env
 service/grammar.db
+service/media/
 
 # Node / Next.js
 node_modules/

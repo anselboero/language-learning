@@ -21,6 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <nav>
               <Link href="/sections">Grammar</Link>
               <Link href="/reading">Reading</Link>
+              <Link href="/listening">Listening</Link>
               <Link href="/flashcards">Cards</Link>
               <Link href="/upload" className="upload-link">
                 Upload

@@ -21,10 +21,15 @@ Endpoints:
 
 from __future__ import annotations
 
+import mimetypes
+import os
+import re
+import shutil
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 
 from . import claude_client, db, dictionary, srs
 from .models import (
@@ -40,12 +45,17 @@ from .models import (
     CardSuggestRequest,
     ChapterDetail,
     ChapterWithSections,
+    DictationCheckRequest,
     Exercise,
     Flashcard,
     FlashcardData,
     FreeAskRequest,
     GrammarContextRequest,
     GrammarSection,
+    ListeningClip,
+    ListeningClipData,
+    ListeningSource,
+    ReviewItem,
     ReviewRequest,
     TranslateRequest,
     TranslateResponse,
@@ -309,3 +319,190 @@ def delete_flashcard(card_id: int) -> dict[str, bool]:
     if not db.delete_flashcard(card_id):
         raise HTTPException(404, "Flashcard not found.")
     return {"deleted": True}
+
+
+# --- listening: sources, dictation clips, media ------------------------------
+
+# Uploaded videos are copied here and streamed back by range; the originals on the
+# learner's disk are left alone. Configurable, defaults to service/media.
+MEDIA_DIR = os.environ.get(
+    "GRAMMAR_MEDIA_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "media")
+)
+
+
+def _save_media(upload: UploadFile) -> str:
+    """Stream an uploaded media file into MEDIA_DIR, returning its stored path.
+
+    The filename is sanitised and de-duplicated so two uploads never collide. The
+    file is copied in chunks rather than read whole, so large videos don't blow up
+    memory.
+    """
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(upload.filename or "")) or "video"
+    stem, ext = os.path.splitext(name)
+    dest = os.path.join(MEDIA_DIR, name)
+    i = 1
+    while os.path.exists(dest):
+        dest = os.path.join(MEDIA_DIR, f"{stem}_{i}{ext}")
+        i += 1
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(upload.file, out, length=1024 * 1024)
+    return dest
+
+
+@app.post("/listening/ingest", response_model=ListeningSource)
+async def ingest_listening(
+    title: str = Form(...),
+    video: UploadFile = File(...),
+    srt: UploadFile = File(...),
+) -> ListeningSource:
+    """Curate an uploaded video + its SRT into dictation clips."""
+    srt_text = await _read_text(srt)
+    video_path = _save_media(video)
+    try:
+        clips = claude_client.curate_clips(srt_text)
+    except Exception as exc:  # noqa: BLE001
+        # Don't leave an orphan video behind if curation fails.
+        try:
+            os.remove(video_path)
+        except OSError:
+            pass
+        raise HTTPException(502, f"Listening ingestion failed: {exc}") from exc
+    return db.create_listening_source(title, video_path, clips)
+
+
+@app.get("/listening/sources", response_model=list[ListeningSource])
+def listening_sources() -> list[ListeningSource]:
+    return db.list_listening_sources()
+
+
+@app.get("/listening/sources/{source_id}/clips", response_model=list[ListeningClip])
+def listening_source_clips(source_id: int) -> list[ListeningClip]:
+    if not db.get_listening_source(source_id):
+        raise HTTPException(404, "Listening source not found.")
+    return db.list_clips_for_source(source_id)
+
+
+@app.delete("/listening/sources/{source_id}")
+def delete_listening_source(source_id: int) -> dict[str, bool]:
+    source = db.get_listening_source(source_id)
+    if not source:
+        raise HTTPException(404, "Listening source not found.")
+    db.delete_listening_source(source_id)
+    # Remove our stored copy too — but only files that live inside MEDIA_DIR.
+    if os.path.abspath(source.video_path).startswith(os.path.abspath(MEDIA_DIR) + os.sep):
+        try:
+            os.remove(source.video_path)
+        except OSError:
+            pass
+    return {"deleted": True}
+
+
+@app.get("/listening/clips", response_model=list[ListeningClip])
+def listening_clips() -> list[ListeningClip]:
+    return db.list_clips()
+
+
+@app.put("/listening/clips/{clip_id}", response_model=ListeningClip)
+def update_listening_clip(clip_id: int, clip: ListeningClipData) -> ListeningClip:
+    updated = db.update_listening_clip(clip_id, clip)
+    if not updated:
+        raise HTTPException(404, "Clip not found.")
+    return updated
+
+
+@app.post("/listening/clips/{clip_id}/review", response_model=ListeningClip)
+def review_listening_clip(clip_id: int, req: ReviewRequest) -> ListeningClip:
+    try:
+        updated = db.review_listening_clip(clip_id, req.rating)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not updated:
+        raise HTTPException(404, "Clip not found.")
+    return updated
+
+
+@app.post("/listening/clips/{clip_id}/check", response_model=AnswerCheck)
+def check_dictation(clip_id: int, req: DictationCheckRequest) -> AnswerCheck:
+    clip = db.get_listening_clip(clip_id)
+    if not clip:
+        raise HTTPException(404, "Clip not found.")
+    try:
+        return claude_client.check_dictation(
+            clip.transcript_de, clip.transcript_en, req.answer, db.list_sections()
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Dictation check failed: {exc}") from exc
+
+
+@app.delete("/listening/clips/{clip_id}")
+def delete_listening_clip(clip_id: int) -> dict[str, bool]:
+    if not db.delete_listening_clip(clip_id):
+        raise HTTPException(404, "Clip not found.")
+    return {"deleted": True}
+
+
+_RANGE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def _media_response(path: str, request: Request) -> Response:
+    """Serve a local media file, honouring HTTP Range so the player can seek."""
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Media file is no longer on disk.")
+    file_size = os.path.getsize(path)
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    headers = {"accept-ranges": "bytes"}
+
+    start, end, status = 0, file_size - 1, 200
+    range_header = request.headers.get("range")
+    if range_header and (m := _RANGE.match(range_header.strip())):
+        g1, g2 = m.group(1), m.group(2)
+        if g1 == "" and g2:  # suffix range: last N bytes
+            start, end = max(0, file_size - int(g2)), file_size - 1
+        else:
+            start = int(g1) if g1 else 0
+            end = int(g2) if g2 else file_size - 1
+        end = min(end, file_size - 1)
+        if start > end or start >= file_size:
+            return Response(
+                status_code=416, headers={"content-range": f"bytes */{file_size}"}
+            )
+        status = 206
+        headers["content-range"] = f"bytes {start}-{end}/{file_size}"
+
+    length = end - start + 1
+    headers["content-length"] = str(length)
+
+    def stream(chunk_size: int = 1024 * 1024):
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                data = f.read(min(chunk_size, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    return StreamingResponse(stream(), status_code=status, headers=headers, media_type=media_type)
+
+
+@app.get("/listening/sources/{source_id}/media")
+def listening_media(source_id: int, request: Request) -> Response:
+    source = db.get_listening_source(source_id)
+    if not source:
+        raise HTTPException(404, "Listening source not found.")
+    return _media_response(source.video_path, request)
+
+
+# --- unified review feed -----------------------------------------------------
+
+
+@app.get("/review/due", response_model=list[ReviewItem])
+def review_due() -> list[ReviewItem]:
+    """The mixed review queue: due vocab cards and listening clips, oldest-due first."""
+    today = srs._today().isoformat()
+    items = [ReviewItem(kind="vocab", due=c.due, vocab=c) for c in db.list_due_flashcards(today)]
+    items += [ReviewItem(kind="listening", due=c.due, listening=c) for c in db.list_due_clips(today)]
+    items.sort(key=lambda i: i.due)
+    return items

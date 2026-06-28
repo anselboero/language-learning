@@ -105,6 +105,7 @@ button:disabled {
 }
 
 input[type="text"],
+input[type="file"],
 textarea {
   width: 100%;
   border: 1px solid var(--border);
@@ -114,6 +115,21 @@ textarea {
   font-family: inherit;
   background: var(--bg);
   color: var(--text);
+}
+
+input[type="file"] {
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 0.4rem 0.9rem;
+  margin-right: 0.75rem;
+  font-size: 0.9rem;
+  font-family: inherit;
+  cursor: pointer;
 }
 
 .row {
@@ -583,4 +599,47 @@ button.ghost:hover {
 .manage-meta {
   font-size: 0.8rem;
   margin: 0.3rem 0 0;
+}
+
+/* --- listening: ingest fields, clip player, clip rows --------------------- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.8rem;
+}
+.field > span {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.listening-meta {
+  font-size: 0.85rem;
+}
+
+.listening-video {
+  width: 100%;
+  max-width: 480px;
+  border-radius: 8px;
+  background: #000;
+  display: block;
+  margin: 0.2rem 0 0.8rem;
+}
+
+.listening-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.8rem;
+}
+
+.clip-row {
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--border);
+}
+.clip-row:first-child {
+  border-top: none;
+  padding-top: 0;
 }

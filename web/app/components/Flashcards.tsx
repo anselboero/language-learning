@@ -1,20 +1,26 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  checkDictation,
   checkFlashcardAnswer,
+  clipMediaUrl,
   deleteFlashcard,
-  listDueFlashcards,
+  listDueReview,
   listFlashcards,
   reviewFlashcard,
+  reviewListeningClip,
   updateFlashcard,
   type AnswerCheck,
   type Flashcard,
   type FlashcardData,
+  type ListeningClip,
   type Rating,
+  type ReviewItem,
 } from "@/lib/api";
 import { CardBack, highlight } from "./FlashcardFace";
 import CardFields from "./CardFields";
+import Inspector, { type Subject } from "./Inspector";
 import Markdown from "./Markdown";
 import SectionRefs from "./SectionRefs";
 
@@ -41,49 +47,152 @@ export default function Flashcards() {
   );
 }
 
-// --- review: work the due queue one card at a time ---------------------------
+// --- review: one mixed queue of vocab cards and listening clips --------------
+
+type Filter = "all" | "vocab" | "listening";
+
+const itemId = (i: ReviewItem) => (i.kind === "vocab" ? i.vocab!.id : i.listening!.id);
 
 function Review() {
-  const [queue, setQueue] = useState<Flashcard[] | null>(null);
+  const [queue, setQueue] = useState<ReviewItem[] | null>(null);
+  const [filter, setFilter] = useState<Filter>("all");
+
+  useEffect(() => {
+    listDueReview().then(setQueue).catch(() => setQueue([]));
+  }, []);
+
+  // Drop the graded item from the queue; 'again' requeues it for later in the session.
+  function afterGrade(item: ReviewItem, rating: Rating, updated: ReviewItem) {
+    setQueue((q) => {
+      const rest = (q ?? []).filter(
+        (x) => !(x.kind === item.kind && itemId(x) === itemId(item)),
+      );
+      return rating === "again" ? [...rest, updated] : rest;
+    });
+  }
+
+  if (queue === null) return <p className="muted">Loading…</p>;
+  if (queue.length === 0) {
+    return (
+      <div className="card">
+        <p style={{ margin: 0 }}>🎉 You&apos;re all caught up — nothing due right now.</p>
+      </div>
+    );
+  }
+
+  const vocabCount = queue.filter((i) => i.kind === "vocab").length;
+  const listeningCount = queue.filter((i) => i.kind === "listening").length;
+  const view = filter === "all" ? queue : queue.filter((i) => i.kind === filter);
+  const current = view[0];
+
+  return (
+    <>
+      <div className="row" style={{ justifyContent: "space-between", marginTop: 0 }}>
+        <p className="muted" style={{ margin: 0 }}>{view.length} due</p>
+        <div className="toggle">
+          <button className={`seg ${filter === "all" ? "active" : ""}`} onClick={() => setFilter("all")}>
+            All ({queue.length})
+          </button>
+          <button className={`seg ${filter === "vocab" ? "active" : ""}`} onClick={() => setFilter("vocab")}>
+            Vocab ({vocabCount})
+          </button>
+          <button
+            className={`seg ${filter === "listening" ? "active" : ""}`}
+            onClick={() => setFilter("listening")}
+          >
+            Listening ({listeningCount})
+          </button>
+        </div>
+      </div>
+
+      {!current ? (
+        <div className="card">
+          <p style={{ margin: 0 }}>Nothing due in this filter.</p>
+        </div>
+      ) : current.kind === "vocab" ? (
+        <VocabReviewCard
+          key={`v${current.vocab!.id}`}
+          card={current.vocab!}
+          onGraded={(rating, updated) =>
+            afterGrade(current, rating, { kind: "vocab", due: updated.due, vocab: updated, listening: null })
+          }
+        />
+      ) : (
+        <ListeningReviewCard
+          key={`l${current.listening!.id}`}
+          clip={current.listening!}
+          onGraded={(rating, updated) =>
+            afterGrade(current, rating, {
+              kind: "listening",
+              due: updated.due,
+              vocab: null,
+              listening: updated,
+            })
+          }
+        />
+      )}
+    </>
+  );
+}
+
+// The four-button SM-2 grade row, shared by both card kinds.
+function GradeRow({ onGrade, disabled }: { onGrade: (r: Rating) => void; disabled: boolean }) {
+  return (
+    <div className="review-grades">
+      <button className="grade again" onClick={() => onGrade("again")} disabled={disabled}>
+        Again
+      </button>
+      <button className="grade hard" onClick={() => onGrade("hard")} disabled={disabled}>
+        Hard
+      </button>
+      <button className="grade good" onClick={() => onGrade("good")} disabled={disabled}>
+        Good
+      </button>
+      <button className="grade easy" onClick={() => onGrade("easy")} disabled={disabled}>
+        Easy
+      </button>
+    </div>
+  );
+}
+
+// Claude's verdict block, shared by both card kinds.
+function ClaudeReview({ review }: { review: AnswerCheck }) {
+  return (
+    <div className={`claude-review ${review.correct ? "ok" : "bad"}`}>
+      <span className="claude-verdict">{review.correct ? "✓ Correct" : "✗ Not quite"}</span>
+      <Markdown>{review.feedback}</Markdown>
+      {review.section_numbers.length > 0 && (
+        <p className="muted claude-refs">
+          Grammar: <SectionRefs refs={review.section_numbers} />
+        </p>
+      )}
+    </div>
+  );
+}
+
+// A vocab card: shown the English, recall the German, reveal the back, grade.
+function VocabReviewCard({
+  card,
+  onGraded,
+}: {
+  card: Flashcard;
+  onGraded: (rating: Rating, updated: Flashcard) => void;
+}) {
   const [revealed, setRevealed] = useState(false);
   const [grading, setGrading] = useState(false);
   const [typed, setTyped] = useState("");
   const [review, setReview] = useState<AnswerCheck | null>(null);
   const [checking, setChecking] = useState(false);
 
-  useEffect(() => {
-    listDueFlashcards().then(setQueue).catch(() => setQueue([]));
-  }, []);
-
-  if (queue === null) return <p className="muted">Loading…</p>;
-  if (queue.length === 0) {
-    return (
-      <div className="card">
-        <p style={{ margin: 0 }}>🎉 You&apos;re all caught up — no cards due right now.</p>
-      </div>
-    );
-  }
-
-  const card = queue[0];
-
   async function grade(rating: Rating) {
     setGrading(true);
     try {
-      const updated = await reviewFlashcard(card.id, rating);
-      setQueue((q) => {
-        const rest = (q ?? []).slice(1);
-        // 'again' keeps the card in this session until it's recalled.
-        return rating === "again" ? [...rest, updated] : rest;
-      });
-      setRevealed(false);
-      setTyped("");
-      setReview(null);
+      onGraded(rating, await reviewFlashcard(card.id, rating));
     } finally {
       setGrading(false);
     }
   }
 
-  // Ask Claude to assess what the learner typed, after the answer is shown.
   async function reviewWithClaude() {
     setChecking(true);
     try {
@@ -96,86 +205,213 @@ function Review() {
   }
 
   return (
-    <>
-      <p className="muted" style={{ marginTop: 0 }}>{queue.length} due</p>
-      <div className="card review-card">
-        <p className="card-sentence">{highlight(card.english, card.target_en)}</p>
+    <div className="card review-card">
+      <p className="card-sentence">{highlight(card.english, card.target_en)}</p>
 
-        {revealed ? (
-          <>
-            {typed.trim() !== "" && (
-              <p className="your-answer">
-                {diffWords(typed, card.german).map((w, idx) => (
-                  <span key={idx} className={w.ok ? "w-ok" : "w-bad"}>
-                    {w.word}{" "}
-                  </span>
-                ))}
-              </p>
-            )}
-            <hr className="card-rule" />
-            <CardBack card={card} />
+      {revealed ? (
+        <>
+          {typed.trim() !== "" && (
+            <p className="your-answer">
+              {diffWords(typed, card.german).map((w, idx) => (
+                <span key={idx} className={w.ok ? "w-ok" : "w-bad"}>
+                  {w.word}{" "}
+                </span>
+              ))}
+            </p>
+          )}
+          <hr className="card-rule" />
+          <CardBack card={card} />
 
-            {typed.trim() !== "" && !review && (
-              <button
-                className="ghost"
-                onClick={reviewWithClaude}
-                disabled={checking}
-                style={{ marginTop: "1rem" }}
-              >
-                {checking ? "Reviewing…" : "Review with Claude"}
-              </button>
-            )}
-            {review && (
-              <div className={`claude-review ${review.correct ? "ok" : "bad"}`}>
-                <span className="claude-verdict">{review.correct ? "✓ Correct" : "✗ Not quite"}</span>
-                <Markdown>{review.feedback}</Markdown>
-                {review.section_numbers.length > 0 && (
-                  <p className="muted claude-refs">
-                    Grammar: <SectionRefs refs={review.section_numbers} />
-                  </p>
-                )}
-              </div>
-            )}
-
-            <div className="review-grades">
-              <button className="grade again" onClick={() => grade("again")} disabled={grading}>
-                Again
-              </button>
-              <button className="grade hard" onClick={() => grade("hard")} disabled={grading}>
-                Hard
-              </button>
-              <button className="grade good" onClick={() => grade("good")} disabled={grading}>
-                Good
-              </button>
-              <button className="grade easy" onClick={() => grade("easy")} disabled={grading}>
-                Easy
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <textarea
-              className="review-input"
-              rows={2}
-              value={typed}
-              autoFocus
-              placeholder="Write the German…"
-              onChange={(e) => setTyped(e.target.value)}
-              onKeyDown={(e) => {
-                // Enter reveals; Shift+Enter inserts a newline.
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  setRevealed(true);
-                }
-              }}
-            />
-            <button onClick={() => setRevealed(true)} style={{ marginTop: "0.8rem" }}>
-              Show answer
+          {typed.trim() !== "" && !review && (
+            <button className="ghost" onClick={reviewWithClaude} disabled={checking} style={{ marginTop: "1rem" }}>
+              {checking ? "Reviewing…" : "Review with Claude"}
             </button>
-          </>
-        )}
+          )}
+          {review && <ClaudeReview review={review} />}
+
+          <GradeRow onGrade={grade} disabled={grading} />
+        </>
+      ) : (
+        <>
+          <textarea
+            className="review-input"
+            rows={2}
+            value={typed}
+            autoFocus
+            placeholder="Write the German…"
+            onChange={(e) => setTyped(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                setRevealed(true);
+              }
+            }}
+          />
+          <button onClick={() => setRevealed(true)} style={{ marginTop: "0.8rem" }}>
+            Show answer
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+// A listening clip: hear it, transcribe the German by ear, reveal the transcript
+// (with the diff), grade. The revealed transcript is selectable for lookup, and
+// the English stays a tap away.
+const SPEEDS = [0.75, 1, 1.25];
+
+function ListeningReviewCard({
+  clip,
+  onGraded,
+}: {
+  clip: ListeningClip;
+  onGraded: (rating: Rating, updated: ListeningClip) => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [speed, setSpeed] = useState(1);
+  const [revealed, setRevealed] = useState(false);
+  const [showEnglish, setShowEnglish] = useState(false);
+  const [grading, setGrading] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [review, setReview] = useState<AnswerCheck | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [subject, setSubject] = useState<Subject | null>(null);
+
+  // Play only the clip's span: seek to its start, then pause once it reaches the end.
+  function playClip() {
+    const v = videoRef.current;
+    if (!v) return;
+    v.currentTime = clip.start_ms / 1000;
+    v.playbackRate = speed;
+    void v.play();
+  }
+
+  function onTimeUpdate() {
+    const v = videoRef.current;
+    if (v && v.currentTime >= clip.end_ms / 1000) v.pause();
+  }
+
+  function setRate(rate: number) {
+    setSpeed(rate);
+    if (videoRef.current) videoRef.current.playbackRate = rate;
+  }
+
+  async function grade(rating: Rating) {
+    setGrading(true);
+    try {
+      onGraded(rating, await reviewListeningClip(clip.id, rating));
+    } finally {
+      setGrading(false);
+    }
+  }
+
+  async function reviewWithClaude() {
+    setChecking(true);
+    try {
+      setReview(await checkDictation(clip.id, typed));
+    } catch {
+      /* leave the clip usable if the check fails */
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  // Open the inspector on whatever German the learner highlighted in the transcript.
+  function captureSelection() {
+    const text = window.getSelection()?.toString().trim();
+    if (text) setSubject({ text, context: clip.transcript_de, english: clip.transcript_en });
+  }
+
+  return (
+    <div className="card review-card">
+      <p className="muted listening-meta" style={{ marginTop: 0 }}>
+        🎧 Listening · {clip.difficulty} · {clip.topic}
+      </p>
+
+      <video
+        ref={videoRef}
+        src={clipMediaUrl(clip.source_id)}
+        className="listening-video"
+        onTimeUpdate={onTimeUpdate}
+        preload="metadata"
+        playsInline
+      />
+
+      <div className="listening-controls">
+        <button onClick={playClip}>▶ Play clip</button>
+        <div className="toggle listening-speeds">
+          {SPEEDS.map((s) => (
+            <button key={s} className={`seg ${speed === s ? "active" : ""}`} onClick={() => setRate(s)}>
+              {s}×
+            </button>
+          ))}
+        </div>
       </div>
-    </>
+
+      {revealed ? (
+        <>
+          {typed.trim() !== "" && (
+            <p className="your-answer">
+              {diffWords(typed, clip.transcript_de).map((w, idx) => (
+                <span key={idx} className={w.ok ? "w-ok" : "w-bad"}>
+                  {w.word}{" "}
+                </span>
+              ))}
+            </p>
+          )}
+          <hr className="card-rule" />
+          <p className="card-sentence" onMouseUp={captureSelection} title="Select any phrase to look it up">
+            {clip.transcript_de}
+          </p>
+
+          {showEnglish ? (
+            <p className="muted" style={{ marginTop: "0.4rem" }}>{clip.transcript_en}</p>
+          ) : (
+            <button className="ghost" onClick={() => setShowEnglish(true)} style={{ marginTop: "0.4rem" }}>
+              Show English
+            </button>
+          )}
+
+          {typed.trim() !== "" && !review && (
+            <button className="ghost" onClick={reviewWithClaude} disabled={checking} style={{ marginTop: "1rem" }}>
+              {checking ? "Reviewing…" : "Review with Claude"}
+            </button>
+          )}
+          {review && <ClaudeReview review={review} />}
+
+          <GradeRow onGrade={grade} disabled={grading} />
+
+          {subject && (
+            <Inspector
+              key={`${subject.text}|${subject.context ?? ""}`}
+              subject={subject}
+              bookId={null}
+              onClose={() => setSubject(null)}
+            />
+          )}
+        </>
+      ) : (
+        <>
+          <textarea
+            className="review-input"
+            rows={2}
+            value={typed}
+            placeholder="Type the German you hear…"
+            onChange={(e) => setTyped(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                setRevealed(true);
+              }
+            }}
+          />
+          <button onClick={() => setRevealed(true)} style={{ marginTop: "0.8rem" }}>
+            Show transcript
+          </button>
+        </>
+      )}
+    </div>
   );
 }
 

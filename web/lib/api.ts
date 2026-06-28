@@ -398,3 +398,133 @@ export async function deleteFlashcard(id: number): Promise<void> {
     await fetch(`${API_BASE}/flashcards/${id}`, { method: "DELETE" }),
   );
 }
+
+// --- listening: video + SRT into dictation clips ----------------------------
+
+export interface ListeningSource {
+  id: number;
+  title: string;
+  video_path: string;
+  clip_count: number;
+  created_at: string;
+}
+
+// A clip's editable content (everything bar its SM-2 schedule).
+export interface ListeningClipData {
+  source_id: number;
+  seq: number;
+  start_ms: number;
+  end_ms: number;
+  transcript_de: string;
+  transcript_en: string;
+  difficulty: string;
+  topic: string;
+}
+
+export interface ListeningClip extends ListeningClipData {
+  id: number;
+  due: string; // ISO date
+  interval: number;
+  ease: number;
+  reps: number;
+  lapses: number;
+  last_reviewed: string | null;
+  created_at: string;
+}
+
+// One due item in the mixed review queue, tagged by kind.
+export interface ReviewItem {
+  kind: "vocab" | "listening";
+  due: string;
+  vocab: Flashcard | null;
+  listening: ListeningClip | null;
+}
+
+export async function ingestListening(
+  title: string,
+  video: File,
+  srt: File,
+): Promise<ListeningSource> {
+  const form = new FormData();
+  form.append("title", title);
+  form.append("video", video);
+  form.append("srt", srt);
+  return unwrap(
+    await fetch(`${API_BASE}/listening/ingest`, { method: "POST", body: form }),
+  );
+}
+
+export async function listListeningSources(): Promise<ListeningSource[]> {
+  return unwrap(
+    await fetch(`${API_BASE}/listening/sources`, { cache: "no-store" }),
+  );
+}
+
+export async function listSourceClips(sourceId: number): Promise<ListeningClip[]> {
+  return unwrap(
+    await fetch(`${API_BASE}/listening/sources/${sourceId}/clips`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function deleteListeningSource(sourceId: number): Promise<void> {
+  await unwrap(
+    await fetch(`${API_BASE}/listening/sources/${sourceId}`, { method: "DELETE" }),
+  );
+}
+
+export async function updateListeningClip(
+  id: number,
+  clip: ListeningClipData,
+): Promise<ListeningClip> {
+  return unwrap(
+    await fetch(`${API_BASE}/listening/clips/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(clip),
+    }),
+  );
+}
+
+export async function reviewListeningClip(
+  id: number,
+  rating: Rating,
+): Promise<ListeningClip> {
+  return unwrap(
+    await fetch(`${API_BASE}/listening/clips/${id}/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rating }),
+    }),
+  );
+}
+
+export async function checkDictation(
+  id: number,
+  answer: string,
+): Promise<AnswerCheck> {
+  return unwrap(
+    await fetch(`${API_BASE}/listening/clips/${id}/check`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    }),
+  );
+}
+
+export async function deleteListeningClip(id: number): Promise<void> {
+  await unwrap(
+    await fetch(`${API_BASE}/listening/clips/${id}`, { method: "DELETE" }),
+  );
+}
+
+// The mixed review queue: due vocab cards and listening clips, oldest-due first.
+export async function listDueReview(): Promise<ReviewItem[]> {
+  return unwrap(await fetch(`${API_BASE}/review/due`, { cache: "no-store" }));
+}
+
+// The Range-served media URL for a source — used directly as a <video>/<audio> src.
+export function clipMediaUrl(sourceId: number): string {
+  return `${API_BASE}/listening/sources/${sourceId}/media`;
+}

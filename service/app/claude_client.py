@@ -23,7 +23,7 @@ import anthropic
 from pydantic import ValidationError
 from pypdf import PdfReader, PdfWriter
 
-from . import dictionary
+from . import dictionary, srt
 from .models import (
     AlignedText,
     AnswerCheck,
@@ -31,6 +31,7 @@ from .models import (
     AssessmentResult,
     CardSuggestion,
     Chapter,
+    CuratedClips,
     DetectedChapters,
     Exercise,
     ExerciseData,
@@ -38,6 +39,7 @@ from .models import (
     ExtractedGrammar,
     GrammarSection,
     GrammarSectionData,
+    ListeningClipData,
     ReadingChapter,
     ReadingSegment,
     SectionSelection,
@@ -784,6 +786,158 @@ def check_answer(
     out = next((b.text for b in response.content if b.type == "text"), None)
     if not out:
         raise RuntimeError("No answer check returned from Claude.")
+    check = AnswerCheck.model_validate(json.loads(out))
+    check.feedback = _decode_escapes(check.feedback)
+    return check
+
+
+# --- listening: curate clips + check dictation -------------------------------
+#
+# A subtitle file is parsed into timed cues (srt.py); Claude curates the most
+# useful conversational spans, translates each, and tags difficulty + topic. It
+# is shown the cues with local indices and returns only which cues form a clip —
+# the timestamps and verbatim German come from the cues themselves, never the
+# model, so a clip always lines up exactly with the audio.
+
+_CURATE_SCHEMA = _strict_schema(CuratedClips)
+
+# Cues per curation call. A whole episode is too long for one pass, so cues are
+# windowed; each window is curated independently and clips don't cross a boundary
+# (a clip is a short span anyway). Windows are processed concurrently.
+LISTENING_CUE_WINDOW = int(os.environ.get("LISTENING_CUE_WINDOW", "120"))
+LISTENING_CONCURRENCY = int(os.environ.get("LISTENING_CONCURRENCY", "6"))
+
+_CURATE_PROMPT = (
+    "You are building a German listening course from a film/series subtitle track. "
+    "Below is a numbered window of consecutive subtitle cues (the on-screen German "
+    "lines, in order). Select the spans that make the BEST short listening exercises "
+    "for a learner — coherent bits of natural conversation that stand on their own.\n\n"
+    "Choose clips that:\n"
+    "- are a few cues long (roughly 1–5 cues / 3–12 seconds of speech), forming one "
+    "complete thought or a short exchange;\n"
+    "- contain real, useful spoken German (a question and answer, an idiom, an everyday "
+    "situation) — skip filler, music/sound markers, names shouted alone, or half-sentences;\n"
+    "- are varied: don't pick overlapping clips, and prefer the most instructive moments.\n\n"
+    "Pick at most the handful of best clips in this window; an empty list is fine if "
+    "nothing stands out. For each clip return:\n"
+    "- start_index / end_index: the 0-based cue numbers (inclusive) that make up the clip;\n"
+    "- english: a faithful, natural English translation of the clip's combined German;\n"
+    "- difficulty: the CEFR level of the clip — 'A1', 'A2', 'B1', 'B2', or 'C1';\n"
+    "- topic: a short 2–4 word label, e.g. 'ordering food', 'making plans', 'an argument'.\n"
+    "Use ONLY indices that appear in the window; never invent or transcribe text."
+)
+
+
+def _curate_window(cues: list[srt.Cue]) -> list[tuple[int, int, str, str, str, str]]:
+    """Curate one window into (start_ms, end_ms, transcript_de, english, difficulty, topic) tuples.
+
+    The model is shown the cues with local indices and returns clip index-ranges; we
+    build the verbatim German and real timestamps from the cues. Clips with
+    out-of-range or inverted indices are dropped.
+    """
+    listing = "\n".join(f"[{i}] {c.text}" for i, c in enumerate(cues))
+    response = _client.messages.create(
+        model=READING_MODEL,
+        max_tokens=4000,
+        output_config={"format": {"type": "json_schema", "schema": _CURATE_SCHEMA}},
+        messages=[{"role": "user", "content": f"{_CURATE_PROMPT}\n\n=== CUES ===\n{listing}"}],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        return []
+    curated = CuratedClips.model_validate(json.loads(out))
+    results: list[tuple[int, int, str, str, str, str]] = []
+    for clip in curated.clips:
+        start, end = clip.start_index, clip.end_index
+        if not (0 <= start <= end < len(cues)):
+            continue
+        transcript_de = " ".join(c.text for c in cues[start : end + 1]).strip()
+        if not transcript_de:
+            continue
+        results.append(
+            (cues[start].start_ms, cues[end].end_ms, transcript_de, clip.english, clip.difficulty, clip.topic)
+        )
+    return results
+
+
+def curate_clips(content: str) -> list[ListeningClipData]:
+    """Parse an SRT and curate it into ordered listening clips (source_id filled later).
+
+    The cues are windowed and curated concurrently; clips are returned in time order
+    with a running ``seq``. ``source_id`` is a placeholder (0) — ``db.create_listening_source``
+    assigns the real one when it stores the source.
+    """
+    cues = srt.parse(content)
+    if not cues:
+        raise RuntimeError("No subtitle cues could be parsed from the SRT file.")
+
+    windows = [cues[i : i + LISTENING_CUE_WINDOW] for i in range(0, len(cues), LISTENING_CUE_WINDOW)]
+    with ThreadPoolExecutor(max_workers=min(LISTENING_CONCURRENCY, len(windows))) as pool:
+        per_window = list(pool.map(_curate_window, windows))
+
+    flat = [tup for window_results in per_window for tup in window_results]
+    flat.sort(key=lambda t: t[0])  # by start_ms, keeping reading order across windows
+    clips: list[ListeningClipData] = []
+    for seq, (start_ms, end_ms, transcript_de, english, difficulty, topic) in enumerate(flat):
+        clips.append(
+            ListeningClipData(
+                source_id=0,
+                seq=seq,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                transcript_de=transcript_de,
+                transcript_en=english,
+                difficulty=difficulty,
+                topic=topic,
+            )
+        )
+    if not clips:
+        raise RuntimeError("No clips could be curated from this subtitle file.")
+    return clips
+
+
+_DICTATION_PROMPT = (
+    "You are a warm, precise German listening tutor. The learner listened to a short "
+    "audio clip and typed out the German they heard (a dictation). You are given the "
+    "TRUE transcript of the clip, its English meaning, the learner's attempt, and a "
+    "catalogue of grammar sections.\n"
+    "Judge whether their transcription faithfully matches what was actually said — this "
+    "is dictation, so reward hearing the words correctly. Minor punctuation or "
+    "capitalisation differences don't matter; missed or misheard words, wrong endings, "
+    "and swapped word order DO. Set 'correct' true only if the attempt captures the "
+    "spoken sentence accurately (a trivially small slip aside).\n"
+    "In 'feedback', start with what they heard correctly, then point out each word they "
+    "missed or misheard and give the correction — focus on the listening gaps (swallowed "
+    "endings, contractions like 'haste' for 'hast du', linked words). Be brief and "
+    "encouraging. Use Markdown, one short paragraph, and write all characters directly as "
+    "UTF-8 (ä, ö, ü, ß, —) — never \\uXXXX escapes.\n"
+    "When a construction the learner missed is explained by one of the provided grammar "
+    "sections, list its decimal number in section_numbers; use ONLY numbers from the "
+    "catalogue, and leave the list empty if none apply."
+)
+
+
+def check_dictation(
+    transcript_de: str, transcript_en: str, answer: str, sections: list[GrammarSection]
+) -> AnswerCheck:
+    """Grade a learner's typed transcription of a listening clip, citing sections when relevant."""
+    catalogue = _index(sections) if sections else "(no grammar sections available)"
+    user = (
+        f"Available grammar sections:\n\n{catalogue}\n\n---\n\n"
+        f"True transcript (German): {transcript_de}\n"
+        f"English meaning: {transcript_en}\n"
+        f"Learner's transcription: {answer}"
+    )
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=900,
+        system=_DICTATION_PROMPT,
+        output_config={"format": {"type": "json_schema", "schema": _ANSWER_CHECK_SCHEMA}},
+        messages=[{"role": "user", "content": user}],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        raise RuntimeError("No dictation check returned from Claude.")
     check = AnswerCheck.model_validate(json.loads(out))
     check.feedback = _decode_escapes(check.feedback)
     return check

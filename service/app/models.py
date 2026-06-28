@@ -488,3 +488,101 @@ class AnswerCheck(BaseModel):
         description="Decimal grammar section numbers (from the provided sections only) whose rules "
         "explain the learner's mistakes, e.g. ['2.1', '21.2']. Empty if none apply.",
     )
+
+
+# --- Listening: video + SRT into dictation clips -----------------------------
+#
+# A listening source is a local video paired with its subtitle (.srt) file. On
+# ingestion the SRT is parsed into timed cues; Claude curates the most useful
+# conversational spans, translates each into English, and tags difficulty + topic.
+# Crucially the model never invents timestamps or German text — it only points at
+# which cues form a clip; the start/end milliseconds and the verbatim German come
+# straight from the SRT. Each clip is reviewed like a flashcard (same SM-2 state):
+# the learner hears it, transcribes the German by ear, and the attempt is checked
+# against the true transcript. Any span of the revealed transcript can then be
+# looked up with the same selection actions reading offers.
+
+
+class SelectedClip(BaseModel):
+    """One clip Claude curated from a window of subtitle cues.
+
+    ``start_index``/``end_index`` are 0-based positions into the window's cue list
+    (inclusive); the service maps them back to real timestamps and verbatim German,
+    so the model is trusted only for curation, translation, and tagging.
+    """
+
+    start_index: int = Field(description="0-based index of the clip's first cue within the window.")
+    end_index: int = Field(description="0-based index of the clip's last cue within the window (inclusive).")
+    english: str = Field(description="Faithful, natural English translation of the clip's combined German.")
+    difficulty: str = Field(description="CEFR level of the clip: 'A1' | 'A2' | 'B1' | 'B2' | 'C1'.")
+    topic: str = Field(description="A short 2-4 word topic label, e.g. 'ordering food' or 'small talk'.")
+
+
+class CuratedClips(BaseModel):
+    """What Claude returns for one window of subtitle cues."""
+
+    clips: list[SelectedClip] = Field(
+        default_factory=list,
+        description="The most useful conversational clips in this window, in order; empty if none stand out.",
+    )
+
+
+class ListeningSourceData(BaseModel):
+    """The local media a listening source is built from."""
+
+    title: str = Field(description="Display title for the source, e.g. the episode name.")
+    video_path: str = Field(description="Absolute path to the local video/audio file on disk.")
+
+
+class ListeningSource(ListeningSourceData):
+    """A stored listening source plus how many clips were curated from it."""
+
+    id: int
+    clip_count: int
+    created_at: str
+
+
+class ListeningClipData(BaseModel):
+    """A listening clip's editable content (everything bar its SM-2 schedule)."""
+
+    source_id: int = Field(description="The listening source this clip belongs to.")
+    seq: int = Field(description="0-based order of the clip within its source.")
+    start_ms: int = Field(description="Clip start within the media, in milliseconds.")
+    end_ms: int = Field(description="Clip end within the media, in milliseconds.")
+    transcript_de: str = Field(description="The German transcript, verbatim from the SRT cues.")
+    transcript_en: str = Field(description="The English translation of the clip.")
+    difficulty: str = Field(description="CEFR level, e.g. 'B1'.")
+    topic: str = Field(description="Short topic label.")
+
+
+class ListeningClip(ListeningClipData):
+    """A stored listening clip plus its spaced-repetition scheduling state."""
+
+    id: int
+    due: str = Field(description="ISO date (YYYY-MM-DD) the clip is next due for review.")
+    interval: float = Field(description="Current inter-review interval in days.")
+    ease: float = Field(description="SM-2 ease factor (>= 1.3).")
+    reps: int = Field(description="Successful reviews in a row.")
+    lapses: int = Field(description="Times the clip was forgotten (rated 'again').")
+    last_reviewed: Optional[str] = Field(default=None, description="ISO datetime of the last review, or null.")
+    created_at: str = Field(description="ISO datetime the clip was created.")
+
+
+class DictationCheckRequest(BaseModel):
+    answer: str = Field(description="The German the learner typed from listening to the clip.")
+
+
+# --- Unified review feed -----------------------------------------------------
+#
+# Vocab flashcards and listening clips are reviewed together in one queue. The
+# feed tags each due item with its ``kind`` and carries the matching card so the
+# client can render and grade it through the right (vocab / listening) endpoints.
+
+
+class ReviewItem(BaseModel):
+    """One due item in the mixed review queue, tagged by kind."""
+
+    kind: str = Field(description="'vocab' | 'listening'.")
+    due: str = Field(description="ISO date the item is due (used to order the queue).")
+    vocab: Optional["Flashcard"] = Field(default=None, description="The card when kind == 'vocab'.")
+    listening: Optional[ListeningClip] = Field(default=None, description="The clip when kind == 'listening'.")
