@@ -11,9 +11,10 @@ Endpoints:
   POST /selection/translate       translate a highlighted span (+ dictionary facts)
   POST /selection/grammar         grammar explanation of a span, grounded in sections
   POST /selection/ask             free-form question about a span, citing sections
-  POST /reading/ingest            turn a German text (English optional) into a diglot book
+  POST /reading/ingest            turn a German text (English optional) into a parallel book
   GET  /reading/books             list ingested reading books
-  GET  /reading/books/{id}        one book with its aligned, weave-ready segments
+  GET  /reading/books/{id}        one book's table of contents (chapters)
+  GET  /reading/books/{id}/chapters/{idx}   one chapter's aligned segments + navigation
   DELETE /reading/books/{id}      remove a reading book
   GET  /health                    liveness probe
 """
@@ -37,6 +38,7 @@ from .models import (
     BookDetail,
     CardSuggestion,
     CardSuggestRequest,
+    ChapterDetail,
     ChapterWithSections,
     Exercise,
     Flashcard,
@@ -214,7 +216,7 @@ async def ingest_book(
     book = db.get_book(book_id)
     if not book:
         raise HTTPException(500, "Book was ingested but could not be loaded.")
-    return Book(**book.model_dump(exclude={"segments"}))
+    return Book(**book.model_dump(exclude={"chapters"}))
 
 
 @app.get("/reading/books", response_model=list[Book])
@@ -228,6 +230,14 @@ def reading_book(book_id: int) -> BookDetail:
     if not book:
         raise HTTPException(404, "Book not found.")
     return book
+
+
+@app.get("/reading/books/{book_id}/chapters/{idx}", response_model=ChapterDetail)
+def reading_chapter(book_id: int, idx: int) -> ChapterDetail:
+    chapter = db.get_chapter(book_id, idx)
+    if not chapter:
+        raise HTTPException(404, "Chapter not found.")
+    return chapter
 
 
 @app.delete("/reading/books/{book_id}")

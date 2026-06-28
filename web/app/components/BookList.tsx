@@ -45,7 +45,8 @@ export default function BookList({ books }: { books: Book[] }) {
             <strong>{book.title}</strong>
             <span className="muted">
               {book.author ? `${book.author} · ` : ""}
-              {book.segment_count} segments · {book.vocab_size} weaveable words
+              {book.chapter_count > 1 ? `${book.chapter_count} chapters · ` : ""}
+              {book.segment_count} segments
             </span>
           </Link>
           <button

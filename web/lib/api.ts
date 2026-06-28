@@ -79,31 +79,41 @@ export interface AssessmentResult {
   review_sections: string[];
 }
 
-// --- reading: diglot-weave books -------------------------------------------
-
-export interface WeaveChunk {
-  text: string; // verbatim English surface text
-  de: string | null; // German form to weave in, or null if not weaveable
-  gloss: string | null; // short English meaning shown on tap
-  rank: number | null; // 0-based frequency rank (0 = most frequent); null if not weaveable
-}
+// --- reading: parallel German/English books --------------------------------
 
 export interface ReadingSegment {
   seq: number;
   english: string;
   german: string;
-  chunks: WeaveChunk[];
+}
+
+export interface ChapterMeta {
+  idx: number;
+  title: string;
+  segment_count: number;
 }
 
 export interface Book {
   id: number;
   title: string;
   author: string;
-  vocab_size: number;
   segment_count: number;
+  chapter_count: number; // 1 when the book has no divisions
 }
 
+// A book's table of contents (chapter list), without the segment text.
 export interface BookDetail extends Book {
+  chapters: ChapterMeta[];
+}
+
+// One chapter's readable content plus navigation to its neighbours.
+export interface ChapterDetail {
+  book_id: number;
+  book_title: string;
+  idx: number;
+  title: string;
+  prev_idx: number | null;
+  next_idx: number | null;
   segments: ReadingSegment[];
 }
 
@@ -230,6 +240,17 @@ export async function listBooks(): Promise<Book[]> {
 export async function getBook(id: number): Promise<BookDetail> {
   return unwrap(
     await fetch(`${API_BASE}/reading/books/${id}`, { cache: "no-store" }),
+  );
+}
+
+export async function getChapter(
+  bookId: number,
+  idx: number,
+): Promise<ChapterDetail> {
+  return unwrap(
+    await fetch(`${API_BASE}/reading/books/${bookId}/chapters/${idx}`, {
+      cache: "no-store",
+    }),
   );
 }
 

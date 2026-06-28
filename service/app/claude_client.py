@@ -31,16 +31,17 @@ from .models import (
     AssessmentResult,
     CardSuggestion,
     Chapter,
+    DetectedChapters,
     Exercise,
     ExerciseData,
     ExtractedExercises,
     ExtractedGrammar,
     GrammarSection,
     GrammarSectionData,
+    ReadingChapter,
     ReadingSegment,
     SectionSelection,
     SelectionTranslation,
-    StoredChunk,
     SubmittedAnswer,
 )
 
@@ -52,12 +53,12 @@ MODEL = "claude-opus-4-8"
 # features (ask/assess/theory extraction) stay on the Opus MODEL above.
 READING_MODEL = os.environ.get("READING_MODEL", "claude-sonnet-4-6")
 
-# A whole book won't fit in one structured-output pass (the weave JSON is far
-# larger than the source text and hits the 32k output cap), so German-only
-# ingestion is split into chunks of roughly this many characters. Each chunk is
-# translated+aligned independently, then all segments are merged and ranked
-# globally. A chunk that still overflows is split in half and retried.
-READING_CHUNK_CHARS = int(os.environ.get("READING_CHUNK_CHARS", "6000"))
+# A whole book won't fit in one structured-output pass (German + English roughly
+# doubles the source and would hit the 32k output cap), so German-only ingestion
+# is split into chunks of roughly this many characters. Each chunk is
+# translated+aligned independently, then all segments are merged in reading order.
+# A chunk that still overflows is split in half and retried.
+READING_CHUNK_CHARS = int(os.environ.get("READING_CHUNK_CHARS", "12000"))
 
 # Chunks are independent, so they're aligned concurrently to cut wall-clock on
 # long books. Kept modest to stay within the model's rate limits.
@@ -836,79 +837,52 @@ def assess(
     return AssessmentResult.model_validate(json.loads(text))
 
 
-# --- reading: diglot-weave alignment -----------------------------------------
+# --- reading: sentence-level alignment ---------------------------------------
 
 _ALIGN_SCHEMA = _strict_schema(AlignedText)
 
 _ALIGN_PROMPT = (
     "You are given the SAME book in two languages: an English text and its German "
     "translation. Align them into sentence-level segments in reading order, so that "
-    "each segment pairs one English sentence (or a couple of short ones that must stay "
-    "together) with the German sentence(s) that translate it.\n\n"
+    "each segment pairs one German sentence (or a couple of short ones that must stay "
+    "together) with the English that translates it.\n\n"
     "For every segment return:\n"
-    "- `german`: the matching German sentence(s), verbatim from the German text.\n"
-    "- `chunks`: the ENGLISH sentence split into an ordered list of chunks. "
-    "Concatenating every chunk's `text` in order MUST reproduce the English sentence "
-    "exactly, including all spaces and punctuation.\n\n"
-    "A chunk is either plain text or a weaveable word:\n"
-    "- Plain chunks carry the connective text, punctuation, and whitespace; leave their "
-    "`de` and `gloss` null.\n"
-    "- Be THOROUGH: mark EVERY content word as weaveable, not just a representative few. "
-    "Aim to cover essentially all of them — every noun, every main and auxiliary verb, every "
-    "adjective and adverb, and meaningful pronouns and numbers. When a word could plausibly be "
-    "learned, make it weaveable. Only genuine function words (standalone articles, conjunctions, "
-    "prepositions, particles) and punctuation stay as plain chunks. For each weaveable chunk, set "
-    "`de` to the contextually-correct German form and `gloss` to a 1–3 word English meaning.\n"
-    "  • For a noun, GROUP it with its preceding article/determiner into one chunk "
-    "(`text` = 'the wolf') and give the full German noun phrase with the correct article "
-    "and capitalization in `de` (`de` = 'der Wolf').\n"
-    "  • For a verb or adjective, weave just the word, inflected to match the German "
-    "translation as it actually appears.\n"
-    "  • Group a MULTI-WORD UNIT into one weaveable chunk when the German is a fixed or "
-    "idiomatic expression that does NOT map word-for-word to the English — e.g. genitive/time "
-    "phrases ('one morning' → 'eines Morgens'), set phrases ('for example' → 'zum Beispiel'), "
-    "or a separable verb with its particle. Set `text` to the whole English span, `de` to the "
-    "whole German phrase, and `gloss` to its meaning. Default to single words; only group when "
-    "word-by-word substitution would read unnaturally or split a fixed expression.\n"
-    "- Do NOT weave proper names or pure function words on their own.\n\n"
-    "Keep the original English wording — never paraphrase. If a German sentence has no "
-    "English counterpart (or vice versa), attach it to the nearest segment rather than "
-    "inventing text."
+    "- `german`: the German sentence(s), verbatim from the German text.\n"
+    "- `english`: the matching English sentence(s), verbatim from the English text — "
+    "never paraphrase.\n\n"
+    "If a German sentence has no English counterpart (or vice versa), attach it to the "
+    "nearest segment rather than inventing text."
 )
 
 
 _TRANSLATE_PROMPT = (
-    "You are given a book in German. Produce an English diglot-weave scaffold for it.\n\n"
+    "You are given a book in German. Produce a faithful, sentence-aligned English "
+    "translation of it.\n\n"
     "Work through the German text in reading order, one segment at a time (a sentence, or "
     "a couple of short sentences that must stay together). For every segment return:\n"
     "- `german`: the German sentence(s), VERBATIM from the source — never reword the German.\n"
-    "- `chunks`: a faithful English translation of that segment, split into an ordered list "
-    "of chunks. Aim for natural but LITERAL English — one English sentence per German "
-    "sentence, minimal reordering — so the two line up closely. Concatenating every chunk's "
-    "`text` in order MUST reproduce your English sentence exactly, including spaces and "
-    "punctuation.\n\n"
-    "A chunk is either plain text or a weaveable word:\n"
-    "- Plain chunks carry connective words, punctuation, and whitespace; leave `de`/`gloss` null.\n"
-    "- Be THOROUGH: mark EVERY content word as weaveable, not just a representative few. "
-    "Aim to cover essentially all of them — every noun, every main and auxiliary verb, every "
-    "adjective and adverb, and meaningful pronouns and numbers. When a word could plausibly be "
-    "learned, make it weaveable. Only genuine function words (standalone articles, conjunctions, "
-    "prepositions, particles) and punctuation stay as plain chunks. For each weaveable chunk, set "
-    "`de` to the ACTUAL German word from this segment's original sentence (not a re-translation) "
-    "and `gloss` to a 1–3 word English meaning.\n"
-    "  • For a noun, group it with its preceding English article into one chunk "
-    "(`text` = 'the wolf') and give the German noun phrase with its real article and "
-    "capitalization in `de` (`de` = 'der Wolf'), inflected as it appears in the German.\n"
-    "  • For a verb or adjective, weave just the word, matching the German form actually used.\n"
-    "  • Group a MULTI-WORD UNIT into one weaveable chunk when the German is a fixed or "
-    "idiomatic expression that does NOT map word-for-word to the English — e.g. genitive/time "
-    "phrases ('one morning' → 'eines Morgens'), set phrases ('for example' → 'zum Beispiel'), "
-    "or a separable verb with its particle. Set `text` to the whole English span, `de` to the "
-    "whole German phrase, and `gloss` to its meaning. Default to single words; only group when "
-    "word-by-word substitution would read unnaturally or split a fixed expression.\n"
-    "- Do NOT weave proper names or pure function words on their own.\n\n"
-    "Every woven German word must be a real word from the original German segment, so the "
-    "learner only ever sees the author's own German."
+    "- `english`: a faithful, natural English translation of that segment — one English "
+    "sentence per German sentence, with minimal reordering, so the two line up closely."
+)
+
+
+_CHAPTER_SCHEMA = _strict_schema(DetectedChapters)
+
+_CHAPTER_PROMPT = (
+    "You are given the full text of a book in German. Identify its chapter divisions, "
+    "if any.\n\n"
+    "A chapter division is a structural break the author marked with a heading — for "
+    "example a number ('II', '3'), a word ('Erstes Kapitel', 'Kapitel 2', 'Teil I'), a "
+    "titled heading ('Drittes Kapitel: Die Reise'), or a centered title line. Headings "
+    "sit on their own line, set apart from the surrounding prose. Heading styles vary "
+    "between books — recognise the break however it is marked, not by a fixed pattern.\n\n"
+    "Return the chapters in reading order. For each:\n"
+    "- `title`: the heading EXACTLY as it appears in the text (verbatim).\n"
+    "- `start_excerpt`: the first 6-12 words of that chapter's opening sentence of prose, "
+    "copied verbatim from the text, so the boundary can be located precisely.\n\n"
+    "Only report genuine chapter or section breaks. If the text has no chapter divisions "
+    "at all, return an empty list. Never invent headings, and do not treat ordinary "
+    "paragraph breaks, scene breaks, or lines of dialogue as chapters."
 )
 
 
@@ -937,50 +911,6 @@ def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
         return text
 
     return _with_retries(_call)
-
-
-_LEMMA_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)
-
-
-def _lemma_key(chunk: Any) -> str:
-    """Stable grouping key for a weaveable chunk: its meaning, lowercased.
-
-    Strips a leading English article so 'grandmother' and 'the grandmother' count
-    as one word for frequency ranking, regardless of how the gloss was phrased.
-    """
-    key = (chunk.gloss or chunk.text).strip().lower()
-    return _LEMMA_ARTICLE.sub("", key)
-
-
-def _rank_segments(aligned: AlignedText) -> tuple[list[ReadingSegment], int]:
-    """Assign each weaveable chunk a global frequency rank (0 = most frequent).
-
-    Words that recur most across the book get the lowest ranks, so they are woven
-    in first as the density rises — maximizing exposure to high-frequency vocabulary.
-    """
-    counts: dict[str, int] = {}
-    for seg in aligned.segments:
-        for chunk in seg.chunks:
-            if chunk.de:
-                counts[_lemma_key(chunk)] = counts.get(_lemma_key(chunk), 0) + 1
-
-    ordered = sorted(counts, key=lambda k: (-counts[k], k))
-    rank_of = {key: i for i, key in enumerate(ordered)}
-
-    segments: list[ReadingSegment] = []
-    for i, seg in enumerate(aligned.segments):
-        stored = [
-            StoredChunk(
-                text=chunk.text,
-                de=chunk.de,
-                gloss=chunk.gloss,
-                rank=rank_of[_lemma_key(chunk)] if chunk.de else None,
-            )
-            for chunk in seg.chunks
-        ]
-        english = "".join(chunk.text for chunk in seg.chunks)
-        segments.append(ReadingSegment(seq=i, english=english, german=seg.german, chunks=stored))
-    return segments, len(ordered)
 
 
 # --- text chunking for long books -------------------------------------------
@@ -1072,20 +1002,89 @@ def _translate_chunk(german: str, attempt: int = 0) -> list[AlignedSegmentData]:
         )
 
 
+def _detect_chapters(german_text: str) -> list[DetectedChapter]:
+    """Ask Claude for the book's chapter headings; never fatal to ingestion.
+
+    Runs over the whole text in one pass and returns only the headings plus a short
+    opening excerpt per chapter, so the output stays tiny. Any failure (a refusal, a
+    too-long text that overflows the context, malformed JSON) degrades to "no chapters"
+    rather than failing the upload.
+    """
+    content = [
+        {"type": "text", "text": _CHAPTER_PROMPT},
+        {"type": "text", "text": f"=== GERMAN TEXT ===\n\n{german_text}"},
+    ]
+    try:
+        raw = _stream_text(content, _CHAPTER_SCHEMA)
+        return DetectedChapters.model_validate_json(raw).chapters
+    except Exception:  # noqa: BLE001 — chapter detection is best-effort, never fatal
+        return []
+
+
+_WS = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    """Collapse whitespace and casefold, for tolerant excerpt matching."""
+    return _WS.sub(" ", text).strip().casefold()
+
+
+def _map_chapters(
+    detected: list[DetectedChapter], segments: list[ReadingSegment]
+) -> list[ReadingChapter]:
+    """Pin each detected chapter to the segment its opening prose falls in.
+
+    Matching the opening excerpt against the aligned German segments is independent of
+    how the heading was formatted, so it works the same for any book. Chapters whose
+    excerpt can't be located, or that don't advance past the previous one, are dropped;
+    the first surviving chapter is anchored to segment 0 so no leading text is orphaned.
+    """
+    seg_norm = [_norm(s.german) for s in segments]
+    chapters: list[ReadingChapter] = []
+    search_from = 0
+    for ch in detected:
+        words = _norm(ch.start_excerpt).split()
+        if not words:
+            continue
+        # Try the full excerpt, then progressively shorter prefixes, in case the model
+        # included a word or two beyond where the segment boundary actually falls.
+        found: int | None = None
+        for length in (len(words), 8, 6, 4):
+            needle = " ".join(words[:length])
+            if not needle:
+                continue
+            found = next(
+                (i for i in range(search_from, len(segments)) if needle in seg_norm[i]),
+                None,
+            )
+            if found is not None:
+                break
+        if found is None or (chapters and found <= chapters[-1].start_seq):
+            continue
+        chapters.append(ReadingChapter(idx=len(chapters), title=ch.title.strip(), start_seq=found))
+        search_from = found + 1
+
+    # A book is only "chaptered" if we pinned at least two; otherwise it stays flat.
+    if len(chapters) < 2:
+        return []
+    # Anchor the first chapter to the start so segments before its excerpt aren't lost.
+    chapters[0] = ReadingChapter(idx=0, title=chapters[0].title, start_seq=0)
+    return chapters
+
+
 def ingest_book(
     title: str,
     author: str,
     german_text: str,
     english_text: str | None = None,
 ) -> int:
-    """Ingest a German text into a stored diglot-weave book.
+    """Ingest a German text into a stored, sentence-aligned reading book.
 
     With only the German text, Claude generates a faithful, sentence-aligned English
-    scaffold (the recommended path — the woven words stay the author's own German, and
-    we avoid a published translation's literary license breaking the alignment). The
-    German is split into character-bounded chunks so a full-length book fits, then all
-    segments are merged and ranked globally. If a faithful English translation is
-    supplied, the two are aligned directly in one pass instead.
+    translation (the recommended path — we avoid a published translation's literary
+    license breaking the alignment). The German is split into character-bounded chunks
+    so a full-length book fits, then all segments are merged in reading order. If a
+    faithful English translation is supplied, the two are aligned directly in one pass.
     """
     if english_text:
         content = [
@@ -1114,9 +1113,12 @@ def ingest_book(
     if not segments:
         raise RuntimeError("No aligned segments were produced from these texts.")
 
-    merged = AlignedText(segments=segments)
-    stored_segments, vocab_size = _rank_segments(merged)
+    stored_segments = [
+        ReadingSegment(seq=i, english=seg.english, german=seg.german)
+        for i, seg in enumerate(segments)
+    ]
+    chapters = _map_chapters(_detect_chapters(german_text), stored_segments)
 
     from . import db
 
-    return db.create_book(title, author, vocab_size, stored_segments)
+    return db.create_book(title, author, stored_segments, chapters)

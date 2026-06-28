@@ -23,7 +23,7 @@ export default function ReadingUpload() {
     setError(null);
     try {
       const book = await ingestBook(title.trim(), author.trim(), german!, english);
-      setStatus(`Done — "${book.title}" aligned into ${book.segment_count} segments (${book.vocab_size} weaveable words).`);
+      setStatus(`Done — "${book.title}" aligned into ${book.segment_count} segments.`);
       setTitle("");
       setAuthor("");
       setGerman(null);
@@ -41,9 +41,8 @@ export default function ReadingUpload() {
       <h2>Add a book</h2>
       <p className="muted">
         Upload a German text (.txt). Claude writes a faithful, sentence-aligned English
-        scaffold and marks the weaveable vocabulary — so the woven words stay the author&apos;s
-        own German. Already have a faithful English translation? Add it as the optional second
-        file to align against that instead.
+        translation so you can reveal it line by line as you read. Already have a faithful
+        English translation? Add it as the optional second file to align against that instead.
       </p>
       <input
         type="text"

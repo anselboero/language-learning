@@ -19,6 +19,8 @@ from .models import (
     BookDetail,
     CardDeclension,
     Chapter,
+    ChapterDetail,
+    ChapterMeta,
     ChapterWithSections,
     Exercise,
     ExerciseData,
@@ -26,8 +28,8 @@ from .models import (
     Flashcard,
     FlashcardData,
     GrammarSection,
+    ReadingChapter,
     ReadingSegment,
-    StoredChunk,
 )
 
 DB_PATH = os.environ.get(
@@ -82,8 +84,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS books (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 title       TEXT NOT NULL,
-                author      TEXT NOT NULL,
-                vocab_size  INTEGER NOT NULL          -- distinct weaveable lemmas
+                author      TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS reading_segments (
@@ -92,7 +93,15 @@ def init_db() -> None:
                 seq      INTEGER NOT NULL,             -- order within the book
                 english  TEXT NOT NULL,
                 german   TEXT NOT NULL,
-                chunks   TEXT NOT NULL,                -- JSON list of {text, de, gloss, rank}
+                FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS reading_chapters (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id    INTEGER NOT NULL,
+                idx        INTEGER NOT NULL,           -- order within the book
+                title      TEXT NOT NULL,
+                start_seq  INTEGER NOT NULL,           -- seq of the chapter's first segment
                 FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
             );
 
@@ -121,9 +130,21 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_sections_chapter ON sections(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_exercises_chapter ON exercises(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_segments_book ON reading_segments(book_id);
+            CREATE INDEX IF NOT EXISTS idx_chapters_book ON reading_chapters(book_id);
             CREATE INDEX IF NOT EXISTS idx_flashcards_due ON flashcards(due);
             """
         )
+        # Drop the legacy diglot-weave columns from a pre-existing DB. The German and
+        # English text we still use are already stored, so books carry over intact.
+        _drop_column_if_present(conn, "books", "vocab_size")
+        _drop_column_if_present(conn, "reading_segments", "chunks")
+
+
+def _drop_column_if_present(conn: sqlite3.Connection, table: str, column: str) -> None:
+    """Idempotently drop ``column`` from ``table`` if the schema still has it."""
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
 
 
 # --- ordering helper ---------------------------------------------------------
@@ -334,41 +355,68 @@ def get_sections_for_exercise(refs: list[str]) -> list[GrammarSection]:
 
 
 def create_book(
-    title: str, author: str, vocab_size: int, segments: list[ReadingSegment]
+    title: str,
+    author: str,
+    segments: list[ReadingSegment],
+    chapters: list[ReadingChapter] | None = None,
 ) -> int:
-    """Store a freshly-aligned book and its segments; returns the new book id."""
+    """Store a freshly-aligned book, its segments, and any chapters; returns the book id."""
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO books (title, author, vocab_size) VALUES (?, ?, ?)",
-            (title, author, vocab_size),
+            "INSERT INTO books (title, author) VALUES (?, ?)",
+            (title, author),
         )
         book_id = int(cur.lastrowid)
         for seg in segments:
             conn.execute(
                 """
-                INSERT INTO reading_segments (book_id, seq, english, german, chunks)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO reading_segments (book_id, seq, english, german)
+                VALUES (?, ?, ?, ?)
                 """,
-                (
-                    book_id,
-                    seg.seq,
-                    seg.english,
-                    seg.german,
-                    json.dumps([c.model_dump() for c in seg.chunks]),
-                ),
+                (book_id, seg.seq, seg.english, seg.german),
+            )
+        for ch in chapters or []:
+            conn.execute(
+                """
+                INSERT INTO reading_chapters (book_id, idx, title, start_seq)
+                VALUES (?, ?, ?, ?)
+                """,
+                (book_id, ch.idx, ch.title, ch.start_seq),
             )
     return book_id
+
+
+def _chapter_rows(conn: sqlite3.Connection, book_id: int) -> list[ReadingChapter]:
+    rows = conn.execute(
+        "SELECT idx, title, start_seq FROM reading_chapters WHERE book_id = ? ORDER BY idx",
+        (book_id,),
+    ).fetchall()
+    return [
+        ReadingChapter(idx=r["idx"], title=r["title"], start_seq=r["start_seq"]) for r in rows
+    ]
+
+
+def _chapter_metas(
+    chapters: list[ReadingChapter], total_segments: int, book_title: str
+) -> list[ChapterMeta]:
+    """The table of contents. A book with no stored chapters reads as one chapter."""
+    if not chapters:
+        return [ChapterMeta(idx=0, title=book_title, segment_count=total_segments)]
+    bounds = [c.start_seq for c in chapters] + [total_segments]
+    return [
+        ChapterMeta(idx=c.idx, title=c.title, segment_count=bounds[i + 1] - c.start_seq)
+        for i, c in enumerate(chapters)
+    ]
 
 
 def list_books() -> list[Book]:
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT b.id, b.title, b.author, b.vocab_size,
-                   COUNT(s.id) AS segment_count
+            SELECT b.id, b.title, b.author,
+                   (SELECT COUNT(*) FROM reading_segments s WHERE s.book_id = b.id) AS segment_count,
+                   (SELECT COUNT(*) FROM reading_chapters c WHERE c.book_id = b.id) AS chapter_count
             FROM books b
-            LEFT JOIN reading_segments s ON s.book_id = b.id
-            GROUP BY b.id
             ORDER BY b.id
             """
         ).fetchall()
@@ -377,43 +425,85 @@ def list_books() -> list[Book]:
             id=r["id"],
             title=r["title"],
             author=r["author"],
-            vocab_size=r["vocab_size"],
             segment_count=r["segment_count"],
+            chapter_count=max(r["chapter_count"], 1),
         )
         for r in rows
     ]
 
 
 def get_book(book_id: int) -> BookDetail | None:
+    """A book's table of contents (chapters), without the segment text itself."""
     with _connect() as conn:
         book = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
         if not book:
             return None
-        seg_rows = conn.execute(
-            "SELECT * FROM reading_segments WHERE book_id = ? ORDER BY seq",
-            (book_id,),
-        ).fetchall()
-    segments = [
-        ReadingSegment(
-            seq=r["seq"],
-            english=r["english"],
-            german=r["german"],
-            chunks=[StoredChunk(**c) for c in json.loads(r["chunks"])],
-        )
-        for r in seg_rows
-    ]
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM reading_segments WHERE book_id = ?", (book_id,)
+        ).fetchone()["n"]
+        chapters = _chapter_rows(conn, book_id)
+    metas = _chapter_metas(chapters, total, book["title"])
     return BookDetail(
         id=book["id"],
         title=book["title"],
         author=book["author"],
-        vocab_size=book["vocab_size"],
-        segment_count=len(segments),
+        segment_count=total,
+        chapter_count=len(metas),
+        chapters=metas,
+    )
+
+
+def get_chapter(book_id: int, idx: int) -> ChapterDetail | None:
+    """One chapter's segments plus navigation to its neighbours.
+
+    With no stored chapters the whole book is chapter 0; otherwise a chapter spans from
+    its ``start_seq`` to the next chapter's (or the end of the book).
+    """
+    with _connect() as conn:
+        book = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+        if not book:
+            return None
+        chapters = _chapter_rows(conn, book_id)
+        count = len(chapters) or 1
+        if idx < 0 or idx >= count:
+            return None
+
+        if chapters:
+            start = chapters[idx].start_seq
+            end = chapters[idx + 1].start_seq if idx + 1 < len(chapters) else None
+            title = chapters[idx].title
+        else:
+            start, end, title = 0, None, book["title"]
+
+        if end is None:
+            seg_rows = conn.execute(
+                "SELECT * FROM reading_segments WHERE book_id = ? AND seq >= ? ORDER BY seq",
+                (book_id, start),
+            ).fetchall()
+        else:
+            seg_rows = conn.execute(
+                "SELECT * FROM reading_segments WHERE book_id = ? AND seq >= ? AND seq < ? ORDER BY seq",
+                (book_id, start, end),
+            ).fetchall()
+
+    segments = [
+        ReadingSegment(seq=r["seq"], english=r["english"], german=r["german"])
+        for r in seg_rows
+    ]
+    return ChapterDetail(
+        book_id=book["id"],
+        book_title=book["title"],
+        idx=idx,
+        title=title,
+        prev_idx=idx - 1 if idx > 0 else None,
+        next_idx=idx + 1 if idx + 1 < count else None,
         segments=segments,
     )
 
 
 def delete_book(book_id: int) -> bool:
     with _connect() as conn:
+        conn.execute("DELETE FROM reading_chapters WHERE book_id = ?", (book_id,))
         conn.execute("DELETE FROM reading_segments WHERE book_id = ?", (book_id,))
         cur = conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
     return cur.rowcount > 0

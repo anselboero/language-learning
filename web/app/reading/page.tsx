@@ -16,9 +16,8 @@ export default async function ReadingPage() {
     <>
       <h2>Reading</h2>
       <p className="muted" style={{ marginTop: 0 }}>
-        Read a book as a <strong>diglot weave</strong>: the text starts in English and
-        German words fade in as you raise the difficulty. Tap any German word to see what
-        it means.
+        Read a book in German and reveal the English line by line. Select any word or
+        phrase to translate it, see its grammar, or make a flashcard.
       </p>
       {error && <p className="error">{error}</p>}
       {!error && <BookList books={books} />}

@@ -268,85 +268,99 @@ class AssessmentResult(BaseModel):
     )
 
 
-# --- Reading: diglot-weave books --------------------------------------------
+# --- Reading: parallel German/English books ---------------------------------
 #
-# A reading book is a parallel English/German text aligned at the sentence level.
-# Each aligned segment is broken into chunks: plain English run-on text plus
-# "weaveable" content words that carry a contextually-correct German replacement.
-# The diglot weave is rendered on the client by swapping in the German form of a
-# chunk once its global frequency rank falls under the chosen density threshold.
-
-
-class WeaveChunkData(BaseModel):
-    """One chunk of an aligned English segment, as Claude returns it.
-
-    Concatenating every chunk's ``text`` in order must reproduce the original
-    English sentence verbatim (spacing and punctuation included). A chunk with a
-    non-null ``de`` is weaveable — the German form can replace its English text.
-    """
-
-    text: str = Field(
-        description="The English surface text of this chunk, verbatim. Plain runs carry "
-        "the spacing and punctuation; a weaveable chunk is just the word/phrase itself."
-    )
-    de: Optional[str] = Field(
-        default=None,
-        description="The contextually-correct German form to weave in for this chunk "
-        "(with article for nouns, correctly inflected), or null if this chunk is not weaveable.",
-    )
-    gloss: Optional[str] = Field(
-        default=None,
-        description="A short English meaning shown when the learner taps the woven word, "
-        "or null for non-weaveable chunks.",
-    )
+# A reading book is a parallel text aligned at the sentence level: each segment
+# pairs the verbatim German sentence(s) with a faithful English translation. The
+# reader shows the German prose and reveals a segment's English on tap; any
+# highlighted span can be looked up via the selection actions above.
+#
+# When the source text is divided into chapters, a separate detection pass finds
+# the headings and records which segment each chapter begins at, so the book can
+# be read a chapter at a time. Books with no detectable chapters stay flat.
 
 
 class AlignedSegmentData(BaseModel):
     """One sentence-level aligned pair as Claude returns it."""
 
-    german: str = Field(description="The aligned German sentence(s), verbatim from the translation.")
-    chunks: list[WeaveChunkData] = Field(
-        default_factory=list,
-        description="The English sentence split into ordered chunks (plain text + weaveable words). "
-        "Concatenating every chunk's `text` must reproduce the English sentence exactly.",
-    )
+    german: str = Field(description="The German sentence(s), verbatim from the source text.")
+    english: str = Field(description="A faithful English translation of the German sentence(s).")
 
 
 class AlignedText(BaseModel):
-    """What Claude returns for an aligned English/German book."""
+    """What Claude returns for an aligned German/English book."""
 
     segments: list[AlignedSegmentData] = Field(default_factory=list)
+
+
+class DetectedChapter(BaseModel):
+    """One chapter heading Claude found in the source text."""
+
+    title: str = Field(
+        description="The chapter heading EXACTLY as printed, e.g. 'II', 'Erstes Kapitel', "
+        "'Chapter 3: The Letter'."
+    )
+    start_excerpt: str = Field(
+        description="The first 6-12 words of this chapter's opening sentence of prose, copied "
+        "verbatim from the text, so the boundary can be located precisely."
+    )
+
+
+class DetectedChapters(BaseModel):
+    """What Claude returns when asked to find a book's chapter divisions."""
+
+    chapters: list[DetectedChapter] = Field(
+        default_factory=list,
+        description="Chapters in reading order; empty if the text has no chapter divisions.",
+    )
 
 
 # --- persisted / response shapes --------------------------------------------
 
 
-class StoredChunk(WeaveChunkData):
-    """A weave chunk plus its global frequency rank (null when not weaveable)."""
-
-    rank: Optional[int] = Field(
-        default=None,
-        description="0-based frequency rank of this word's lemma across the book "
-        "(0 = most frequent, woven in first). Null for non-weaveable chunks.",
-    )
-
-
 class ReadingSegment(BaseModel):
     seq: int = Field(description="0-based position of this segment within the book.")
-    english: str = Field(description="The plain English sentence (derived from the chunks).")
+    english: str
     german: str
-    chunks: list[StoredChunk] = Field(default_factory=list)
+
+
+class ReadingChapter(BaseModel):
+    """A stored chapter: its heading and the segment it begins at."""
+
+    idx: int = Field(description="0-based position of this chapter within the book.")
+    title: str
+    start_seq: int = Field(description="Seq of the first segment belonging to this chapter.")
+
+
+class ChapterMeta(BaseModel):
+    """A chapter as listed in a book's table of contents."""
+
+    idx: int
+    title: str
+    segment_count: int
 
 
 class Book(BaseModel):
     id: int
     title: str
     author: str
-    vocab_size: int = Field(description="Number of distinct weaveable lemmas in the book.")
     segment_count: int
+    chapter_count: int = Field(description="Number of chapters (1 when the book has no divisions).")
 
 
 class BookDetail(Book):
+    chapters: list[ChapterMeta] = Field(default_factory=list)
+
+
+class ChapterDetail(BaseModel):
+    """One chapter's readable content plus navigation to its neighbours."""
+
+    book_id: int
+    book_title: str
+    idx: int
+    title: str
+    prev_idx: Optional[int] = None
+    next_idx: Optional[int] = None
     segments: list[ReadingSegment] = Field(default_factory=list)
 
 
