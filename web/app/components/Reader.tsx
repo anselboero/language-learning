@@ -56,19 +56,25 @@ export default function Reader({ book }: { book: BookDetail }) {
       <div className="reader-text">
         {book.segments.map((seg) => (
           <p key={seg.seq}>
-            {seg.chunks.map((c, i) =>
-              isWoven(c) ? (
-                <span
-                  key={i}
-                  className="woven"
-                  onClick={() => setSelected({ de: c.de!, en: c.text, gloss: c.gloss })}
-                >
-                  {c.de}
+            {seg.chunks.map((c, i) => {
+              if (!isWoven(c)) return <span key={i}>{c.text}</span>;
+              // The model may bake surrounding spaces into the chunk's English
+              // text; keep them around the German so words don't run together.
+              const lead = c.text.slice(0, c.text.length - c.text.trimStart().length);
+              const trail = c.text.slice(c.text.trimEnd().length);
+              return (
+                <span key={i}>
+                  {lead}
+                  <span
+                    className="woven"
+                    onClick={() => setSelected({ de: c.de!, en: c.text, gloss: c.gloss })}
+                  >
+                    {c.de}
+                  </span>
+                  {trail}
                 </span>
-              ) : (
-                <span key={i}>{c.text}</span>
-              ),
-            )}
+              );
+            })}
           </p>
         ))}
       </div>
