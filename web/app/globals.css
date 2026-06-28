@@ -220,6 +220,27 @@ textarea {
   margin-left: 1.4rem;
 }
 
+.chapter-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0.9rem 1.2rem;
+  margin: 0 0 0.6rem;
+  font-size: 1.15rem;
+}
+.chapter-head:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.chapter-count {
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+
 .toggle {
   display: inline-flex;
   border: 1px solid var(--border);
@@ -371,4 +392,201 @@ textarea {
 .dict-source {
   margin: 0.5rem 0 0;
   font-size: 0.82rem;
+}
+
+/* --- flashcards ----------------------------------------------------------- */
+
+/* The editable card preview inside the reading inspector. */
+.card-draft {
+  margin-top: 0.9rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--border);
+}
+.card-draft-label {
+  margin: 0 0 0.6rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+  color: var(--accent);
+}
+.card-field {
+  display: block;
+  margin-bottom: 0.6rem;
+}
+.card-field > span {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.2rem;
+}
+.card-field input[type="text"],
+.card-field textarea,
+.card-field select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+  font-size: 0.95rem;
+  background: var(--bg);
+  color: var(--text);
+}
+.card-field-row {
+  display: flex;
+  gap: 0.6rem;
+}
+.card-field-row .card-field {
+  flex: 1;
+}
+.card-draft-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+button.ghost {
+  background: none;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+button.ghost:hover {
+  color: var(--text);
+}
+
+/* Highlighted target word on a card face. */
+.card-hl {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 4px;
+  padding: 0 0.15rem;
+  font-weight: 600;
+}
+
+/* Review screen. */
+.review-card {
+  text-align: center;
+}
+.card-sentence {
+  font-size: 1.3rem;
+  margin: 0.5rem 0;
+}
+.card-rule {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1rem 0;
+}
+.card-back {
+  text-align: center;
+}
+.card-declension {
+  font-size: 1.05rem;
+  color: var(--accent);
+  font-weight: 600;
+  margin: 0.4rem 0;
+}
+.card-note {
+  text-align: left;
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  font-size: 0.95rem;
+  margin: 0.8rem 0 0;
+}
+.review-input {
+  width: 100%;
+  margin-top: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  font: inherit;
+  font-size: 1.1rem;
+  text-align: center;
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+}
+.your-answer {
+  font-size: 1.1rem;
+  margin: 0.6rem 0 0;
+  font-weight: 600;
+}
+.your-answer .w-ok {
+  color: #2f7d5b;
+}
+.your-answer .w-bad {
+  color: #b3261e;
+  text-decoration: underline;
+  text-decoration-style: wavy;
+  text-decoration-color: #b3261e;
+}
+.review-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  margin-top: 0.8rem;
+}
+.claude-review {
+  text-align: left;
+  border-radius: 8px;
+  padding: 0.8rem 1rem;
+  margin-top: 0.8rem;
+  border: 1px solid var(--border);
+}
+.claude-review.ok {
+  background: #eef7f1;
+  border-color: #bfe0cd;
+}
+.claude-review.bad {
+  background: #fbecea;
+  border-color: #f0c9c4;
+}
+.claude-verdict {
+  display: block;
+  font-weight: 700;
+  font-size: 0.9rem;
+  margin-bottom: 0.3rem;
+}
+.claude-review.ok .claude-verdict {
+  color: #2f7d5b;
+}
+.claude-review.bad .claude-verdict {
+  color: #b3261e;
+}
+.claude-review p {
+  margin: 0.3rem 0 0;
+}
+.claude-refs {
+  font-size: 0.85rem;
+  margin-top: 0.5rem;
+}
+.review-grades {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  margin-top: 1.2rem;
+}
+.grade {
+  flex: 1;
+  max-width: 8rem;
+}
+.grade.again {
+  background: #b3261e;
+}
+.grade.hard {
+  background: #b9770e;
+}
+.grade.easy {
+  background: #2f7d5b;
+}
+
+/* Manage list. */
+.manage-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+.manage-card-body {
+  flex: 1;
+}
+.manage-meta {
+  font-size: 0.8rem;
+  margin: 0.3rem 0 0;
 }

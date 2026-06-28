@@ -4,10 +4,13 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import {
   askAboutSelection,
+  createFlashcard,
+  generateFlashcard,
   grammarContext,
   translateSelection,
   type AskResponse,
   type BookDetail,
+  type CardSuggestion,
   type DictionaryEntry,
   type TranslateResponse,
   type WeaveChunk,
@@ -15,13 +18,14 @@ import {
 import Markdown from "./Markdown";
 
 // What the inspector acts on: a German word or phrase, plus optional surface
-// info (filled when it came from tapping a woven word) and the enclosing German
-// sentence used as context for translation / grammar / questions.
+// info (filled when it came from tapping a woven word), the enclosing German
+// sentence used as context, and that sentence's English (for flashcards).
 interface Subject {
   text: string;
   en?: string | null;
   gloss?: string | null;
   context?: string | null;
+  english?: string | null;
 }
 
 export default function Reader({ book }: { book: BookDetail }) {
@@ -50,10 +54,10 @@ export default function Reader({ book }: { book: BookDetail }) {
   // Open the inspector on whatever German the reader highlighted, using the
   // segment's German sentence as context. Returns whether a selection was found,
   // so callers can suppress a competing click (e.g. the reveal toggle).
-  const captureSelection = (context: string): boolean => {
+  const captureSelection = (context: string, english: string): boolean => {
     const text = window.getSelection()?.toString().trim();
     if (!text) return false;
-    setSubject({ text, context });
+    setSubject({ text, context, english });
     return true;
   };
 
@@ -97,7 +101,7 @@ export default function Reader({ book }: { book: BookDetail }) {
             <p
               key={seg.seq}
               className="full-de"
-              onMouseUp={() => captureSelection(seg.german)}
+              onMouseUp={() => captureSelection(seg.german, seg.english)}
               onClick={() => {
                 // A drag to select text also fires click; don't toggle then.
                 if (window.getSelection()?.toString().trim()) return;
@@ -111,7 +115,7 @@ export default function Reader({ book }: { book: BookDetail }) {
               )}
             </p>
           ) : (
-            <p key={seg.seq} onMouseUp={() => captureSelection(seg.german)}>
+            <p key={seg.seq} onMouseUp={() => captureSelection(seg.german, seg.english)}>
               {seg.chunks.map((c, i) => {
                 if (!isWoven(c)) return <span key={i}>{c.text}</span>;
                 // The model may bake surrounding spaces into the chunk's English
@@ -126,7 +130,7 @@ export default function Reader({ book }: { book: BookDetail }) {
                       onClick={() => {
                         // A click is a collapsed selection; inspect the word itself.
                         if (window.getSelection()?.toString().trim()) return;
-                        setSubject({ text: c.de!, en: c.text, gloss: c.gloss, context: seg.german });
+                        setSubject({ text: c.de!, en: c.text, gloss: c.gloss, context: seg.german, english: seg.english });
                       }}
                     >
                       {c.de}
@@ -144,6 +148,7 @@ export default function Reader({ book }: { book: BookDetail }) {
         <Inspector
           key={`${subject.text}|${subject.en ?? ""}`}
           subject={subject}
+          bookId={book.id}
           onClose={() => setSubject(null)}
         />
       )}
@@ -151,15 +156,24 @@ export default function Reader({ book }: { book: BookDetail }) {
   );
 }
 
-type Action = "translate" | "grammar" | "ask";
+type Action = "translate" | "grammar" | "ask" | "card";
 
-function Inspector({ subject, onClose }: { subject: Subject; onClose: () => void }) {
+function Inspector({
+  subject,
+  bookId,
+  onClose,
+}: {
+  subject: Subject;
+  bookId: number;
+  onClose: () => void;
+}) {
   const [busy, setBusy] = useState<Action | null>(null);
   const [translation, setTranslation] = useState<TranslateResponse | null>(null);
   const [grammar, setGrammar] = useState<AskResponse | null>(null);
   const [answer, setAnswer] = useState<AskResponse | null>(null);
   const [asking, setAsking] = useState(false);
   const [question, setQuestion] = useState("");
+  const [draft, setDraft] = useState<CardSuggestion | null>(null);
 
   async function run<T>(action: Action, fn: () => Promise<T>, set: (v: T) => void) {
     setBusy(action);
@@ -180,6 +194,12 @@ function Inspector({ subject, onClose }: { subject: Subject; onClose: () => void
     if (!question.trim()) return;
     return run("ask", () => askAboutSelection(subject.text, question, subject.context), setAnswer);
   };
+  const doCard = () =>
+    run(
+      "card",
+      () => generateFlashcard(subject.text, subject.context ?? subject.text, subject.english),
+      setDraft,
+    );
 
   return (
     <div className="inspector">
@@ -201,6 +221,9 @@ function Inspector({ subject, onClose }: { subject: Subject; onClose: () => void
         </button>
         <button onClick={() => setAsking((v) => !v)} disabled={busy !== null}>
           Ask Claude
+        </button>
+        <button onClick={doCard} disabled={busy !== null}>
+          {busy === "card" ? "Building…" : "Make flashcard"}
         </button>
       </div>
 
@@ -250,6 +273,176 @@ function Inspector({ subject, onClose }: { subject: Subject; onClose: () => void
           <SectionRefs numbers={answer.section_numbers} />
         </div>
       )}
+
+      {draft && (
+        <CardDraftEditor
+          draft={draft}
+          setDraft={setDraft}
+          bookId={bookId}
+          onDismiss={() => setDraft(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// An editable preview of a generated flashcard. The learner can tweak any field
+// before saving — highlights on the front/back follow the target words live.
+function CardDraftEditor({
+  draft,
+  setDraft,
+  bookId,
+  onDismiss,
+}: {
+  draft: CardSuggestion;
+  setDraft: (c: CardSuggestion) => void;
+  bookId: number;
+  onDismiss: () => void;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const set = <K extends keyof CardSuggestion>(key: K, value: CardSuggestion[K]) =>
+    setDraft({ ...draft, [key]: value });
+  const setDecl = (key: keyof CardSuggestion["declension"], value: string) =>
+    setDraft({ ...draft, declension: { ...draft.declension, [key]: value || null } });
+
+  async function save() {
+    setSaving(true);
+    setError(null);
+    try {
+      await createFlashcard({ ...draft, book_id: bookId });
+      setSaved(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save the card.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (saved) {
+    return (
+      <div className="card-draft">
+        <p style={{ margin: 0 }}>
+          ✓ Saved to your deck. <Link href="/flashcards">Review cards →</Link>
+        </p>
+        <button className="ghost" onClick={onDismiss} style={{ marginTop: "0.6rem" }}>
+          Close
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card-draft">
+      <p className="card-draft-label">New flashcard</p>
+
+      <label className="card-field">
+        <span>Front (English)</span>
+        <input type="text" value={draft.english} onChange={(e) => set("english", e.target.value)} />
+      </label>
+      <label className="card-field">
+        <span>Back (German)</span>
+        <input type="text" value={draft.german} onChange={(e) => set("german", e.target.value)} />
+      </label>
+      <div className="card-field-row">
+        <label className="card-field">
+          <span>Highlight (EN)</span>
+          <input type="text" value={draft.target_en} onChange={(e) => set("target_en", e.target.value)} />
+        </label>
+        <label className="card-field">
+          <span>Highlight (DE)</span>
+          <input type="text" value={draft.target_de} onChange={(e) => set("target_de", e.target.value)} />
+        </label>
+      </div>
+
+      <div className="card-field-row">
+        <label className="card-field" style={{ flex: "0 0 7rem" }}>
+          <span>Type</span>
+          <select value={draft.pos} onChange={(e) => set("pos", e.target.value)}>
+            <option value="noun">noun</option>
+            <option value="verb">verb</option>
+            <option value="other">other</option>
+          </select>
+        </label>
+        <label className="card-field">
+          <span>Lemma</span>
+          <input type="text" value={draft.lemma} onChange={(e) => set("lemma", e.target.value)} />
+        </label>
+      </div>
+
+      {draft.pos === "noun" && (
+        <div className="card-field-row">
+          <label className="card-field" style={{ flex: "0 0 7rem" }}>
+            <span>Gender</span>
+            <select value={draft.declension.gender ?? ""} onChange={(e) => setDecl("gender", e.target.value)}>
+              <option value="">—</option>
+              <option value="der">der</option>
+              <option value="die">die</option>
+              <option value="das">das</option>
+            </select>
+          </label>
+          <label className="card-field">
+            <span>Plural</span>
+            <input
+              type="text"
+              value={draft.declension.plural ?? ""}
+              onChange={(e) => setDecl("plural", e.target.value)}
+            />
+          </label>
+        </div>
+      )}
+
+      {draft.pos === "verb" && (
+        <div className="card-field-row">
+          <label className="card-field">
+            <span>Infinitive</span>
+            <input
+              type="text"
+              value={draft.declension.infinitive ?? ""}
+              onChange={(e) => setDecl("infinitive", e.target.value)}
+            />
+          </label>
+          <label className="card-field">
+            <span>Präteritum</span>
+            <input
+              type="text"
+              value={draft.declension.preterite ?? ""}
+              onChange={(e) => setDecl("preterite", e.target.value)}
+            />
+          </label>
+          <label className="card-field">
+            <span>Perfekt</span>
+            <input
+              type="text"
+              value={draft.declension.perfect ?? ""}
+              onChange={(e) => setDecl("perfect", e.target.value)}
+            />
+          </label>
+        </div>
+      )}
+
+      <label className="card-field">
+        <span>Context Note (optional)</span>
+        <textarea
+          rows={3}
+          value={draft.note ?? ""}
+          onChange={(e) => set("note", e.target.value || null)}
+          placeholder="A short grammar note, if relevant"
+        />
+      </label>
+
+      {error && <p className="error" style={{ margin: "0.4rem 0 0" }}>{error}</p>}
+
+      <div className="card-draft-actions">
+        <button onClick={save} disabled={saving}>
+          {saving ? "Saving…" : "Save card"}
+        </button>
+        <button className="ghost" onClick={onDismiss} disabled={saving}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

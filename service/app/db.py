@@ -13,14 +13,18 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
+from . import srs
 from .models import (
     Book,
     BookDetail,
+    CardDeclension,
     Chapter,
     ChapterWithSections,
     Exercise,
     ExerciseData,
     ExerciseItem,
+    Flashcard,
+    FlashcardData,
     GrammarSection,
     ReadingSegment,
     StoredChunk,
@@ -92,9 +96,32 @@ def init_db() -> None:
                 FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS flashcards (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id         INTEGER,                  -- source reading book, or NULL
+                english         TEXT NOT NULL,            -- front: English sentence
+                german          TEXT NOT NULL,            -- back: German sentence
+                target_de       TEXT NOT NULL,            -- highlighted German word
+                target_en       TEXT NOT NULL,            -- highlighted English word(s)
+                pos             TEXT NOT NULL,            -- 'noun' | 'verb' | 'other'
+                lemma           TEXT NOT NULL,            -- 'das Gemüse' / 'mögen'
+                declension      TEXT NOT NULL,            -- JSON {gender, plural, infinitive, preterite, perfect}
+                note            TEXT,                     -- optional grammar Context Note (Markdown)
+                section_numbers TEXT NOT NULL,            -- JSON list of grammar refs
+                due             TEXT NOT NULL,            -- ISO date next due
+                interval        REAL NOT NULL,            -- days
+                ease            REAL NOT NULL,            -- SM-2 ease factor
+                reps            INTEGER NOT NULL,
+                lapses          INTEGER NOT NULL,
+                last_reviewed   TEXT,                     -- ISO datetime or NULL
+                created_at      TEXT NOT NULL,            -- ISO datetime
+                FOREIGN KEY (book_id) REFERENCES books(id) ON DELETE SET NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sections_chapter ON sections(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_exercises_chapter ON exercises(chapter_number);
             CREATE INDEX IF NOT EXISTS idx_segments_book ON reading_segments(book_id);
+            CREATE INDEX IF NOT EXISTS idx_flashcards_due ON flashcards(due);
             """
         )
 
@@ -116,11 +143,18 @@ def _sort_key(number: str) -> tuple[int, ...]:
 # --- writes ------------------------------------------------------------------
 
 
-def replace_theory(chapters: list[Chapter], sections: list[GrammarSection]) -> dict[str, int]:
-    """Replace all theory content (chapters + sections) with a fresh ingestion."""
+def upsert_theory(chapters: list[Chapter], sections: list[GrammarSection]) -> dict[str, int]:
+    """Add or update the theory in this ingestion, preserving other chapters.
+
+    Ingestion is incremental: you can upload one chapter at a time and earlier
+    chapters stay. Only the chapters PRESENT in this batch are refreshed — their
+    old sections are cleared first so a re-ingest of a chapter replaces it cleanly
+    (rather than leaving stale sections behind), while untouched chapters remain.
+    """
+    touched = {c.number for c in chapters} | {s.chapter_number for s in sections}
     with _connect() as conn:
-        conn.execute("DELETE FROM chapters")
-        conn.execute("DELETE FROM sections")
+        for chapter_number in touched:
+            conn.execute("DELETE FROM sections WHERE chapter_number = ?", (chapter_number,))
         for c in chapters:
             conn.execute(
                 "INSERT OR REPLACE INTO chapters (number, title) VALUES (?, ?)",
@@ -150,9 +184,18 @@ def replace_theory(chapters: list[Chapter], sections: list[GrammarSection]) -> d
     return {"chapters": len(chapters), "sections": len(sections)}
 
 
-def replace_practice(exercises: list[ExerciseData]) -> int:
+def upsert_practice(exercises: list[ExerciseData]) -> int:
+    """Add or update the exercises in this ingestion, preserving other chapters.
+
+    Like theory ingestion, practice is incremental: uploading one workbook chapter
+    keeps the others. Only the chapters PRESENT in this batch are refreshed — their
+    old exercises are cleared first so a re-ingest replaces a chapter cleanly (no
+    duplicates), while untouched chapters remain.
+    """
+    touched = {e.chapter_number for e in exercises}
     with _connect() as conn:
-        conn.execute("DELETE FROM exercises")
+        for chapter_number in touched:
+            conn.execute("DELETE FROM exercises WHERE chapter_number = ?", (chapter_number,))
         for e in exercises:
             conn.execute(
                 """
@@ -373,4 +416,114 @@ def delete_book(book_id: int) -> bool:
     with _connect() as conn:
         conn.execute("DELETE FROM reading_segments WHERE book_id = ?", (book_id,))
         cur = conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
+    return cur.rowcount > 0
+
+
+# --- flashcards --------------------------------------------------------------
+
+
+def _row_to_flashcard(row: sqlite3.Row) -> Flashcard:
+    return Flashcard(
+        id=row["id"],
+        book_id=row["book_id"],
+        english=row["english"],
+        german=row["german"],
+        target_de=row["target_de"],
+        target_en=row["target_en"],
+        pos=row["pos"],
+        lemma=row["lemma"],
+        declension=CardDeclension(**json.loads(row["declension"])),
+        note=row["note"],
+        section_numbers=json.loads(row["section_numbers"]),
+        due=row["due"],
+        interval=row["interval"],
+        ease=row["ease"],
+        reps=row["reps"],
+        lapses=row["lapses"],
+        last_reviewed=row["last_reviewed"],
+        created_at=row["created_at"],
+    )
+
+
+def create_flashcard(card: FlashcardData) -> Flashcard:
+    """Persist a new card with a fresh SM-2 schedule (due immediately)."""
+    sched = srs.initial()
+    created = srs.now_iso()
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO flashcards
+                (book_id, english, german, target_de, target_en, pos, lemma,
+                 declension, note, section_numbers,
+                 due, interval, ease, reps, lapses, last_reviewed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                card.book_id,
+                card.english,
+                card.german,
+                card.target_de,
+                card.target_en,
+                card.pos,
+                card.lemma,
+                json.dumps(card.declension.model_dump()),
+                card.note,
+                json.dumps(card.section_numbers),
+                sched.due,
+                sched.interval,
+                sched.ease,
+                sched.reps,
+                sched.lapses,
+                None,
+                created,
+            ),
+        )
+        row = conn.execute("SELECT * FROM flashcards WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return _row_to_flashcard(row)
+
+
+def list_flashcards() -> list[Flashcard]:
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM flashcards ORDER BY created_at DESC").fetchall()
+    return [_row_to_flashcard(r) for r in rows]
+
+
+def list_due_flashcards(today_iso: str) -> list[Flashcard]:
+    """Cards whose due date is on or before today, oldest-due first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM flashcards WHERE due <= ? ORDER BY due, id",
+            (today_iso,),
+        ).fetchall()
+    return [_row_to_flashcard(r) for r in rows]
+
+
+def get_flashcard(card_id: int) -> Flashcard | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM flashcards WHERE id = ?", (card_id,)).fetchone()
+    return _row_to_flashcard(row) if row else None
+
+
+def review_flashcard(card_id: int, rating: str) -> Flashcard | None:
+    """Apply a review grade, persist the new SM-2 state, return the updated card."""
+    card = get_flashcard(card_id)
+    if not card:
+        return None
+    sched = srs.review(rating, card.interval, card.ease, card.reps, card.lapses)
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE flashcards
+               SET due = ?, interval = ?, ease = ?, reps = ?, lapses = ?, last_reviewed = ?
+             WHERE id = ?
+            """,
+            (sched.due, sched.interval, sched.ease, sched.reps, sched.lapses, srs.now_iso(), card_id),
+        )
+        row = conn.execute("SELECT * FROM flashcards WHERE id = ?", (card_id,)).fetchone()
+    return _row_to_flashcard(row)
+
+
+def delete_flashcard(card_id: int) -> bool:
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM flashcards WHERE id = ?", (card_id,))
     return cur.rowcount > 0

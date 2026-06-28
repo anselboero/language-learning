@@ -13,7 +13,8 @@ import base64
 import json
 import os
 import re
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any
@@ -22,10 +23,13 @@ import anthropic
 from pydantic import ValidationError
 from pypdf import PdfReader, PdfWriter
 
+from . import dictionary
 from .models import (
     AlignedText,
+    AnswerCheck,
     AskResponse,
     AssessmentResult,
+    CardSuggestion,
     Chapter,
     Exercise,
     ExerciseData,
@@ -34,6 +38,7 @@ from .models import (
     GrammarSection,
     GrammarSectionData,
     ReadingSegment,
+    SectionSelection,
     SelectionTranslation,
     StoredChunk,
     SubmittedAnswer,
@@ -61,7 +66,43 @@ READING_CONCURRENCY = int(os.environ.get("READING_CONCURRENCY", "6"))
 # Pages per Claude call during ingestion. Smaller = more calls but bounded output.
 PAGE_WINDOW = int(os.environ.get("INGEST_PAGE_WINDOW", "8"))
 
-_client = anthropic.Anthropic()
+# The API can return transient 429/5xx/529 ("overloaded") errors, especially on a
+# long ingestion that fires many calls. The SDK retries these automatically on
+# plain create() calls; we raise max_retries above the default 2 so a burst of
+# overload doesn't sink a whole ingestion. Streaming calls need extra handling
+# (see _with_retries) because an overload surfacing mid-stream isn't auto-retried.
+_client = anthropic.Anthropic(max_retries=6)
+
+
+# Transient conditions worth retrying with exponential backoff.
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(
+        exc, (anthropic.APIConnectionError, anthropic.RateLimitError, anthropic.InternalServerError)
+    ):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in _RETRYABLE_STATUS
+    return "overloaded" in str(exc).lower()
+
+
+def _with_retries(fn: Callable[[], Any], *, attempts: int = 6, base_delay: float = 2.0) -> Any:
+    """Run a streaming Claude call, retrying transient overload/rate errors.
+
+    The SDK's built-in retry covers non-streaming requests but not an error event
+    that arrives partway through a stream, so the ingestion's streamed calls wrap
+    their body in this. Terminal errors (refusal, output-limit) aren't retryable
+    and propagate immediately.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if attempt == attempts - 1 or not _is_retryable(exc):
+                raise
+            time.sleep(min(base_delay * 2**attempt, 30.0))
 
 
 # --- structured-output schema helper ----------------------------------------
@@ -134,24 +175,29 @@ def _document_block(pdf_bytes: bytes) -> dict[str, Any]:
 def _extract_window(pdf_bytes: bytes, prompt: str, schema: dict[str, Any]) -> str:
     # Stream so we can use a large max_tokens without hitting the SDK's
     # non-streaming timeout guard; table-formatted output runs long.
-    with _client.messages.stream(
-        model=MODEL,
-        max_tokens=32000,
-        output_config={"format": {"type": "json_schema", "schema": schema}},
-        messages=[{"role": "user", "content": [_document_block(pdf_bytes), {"type": "text", "text": prompt}]}],
-    ) as stream:
-        message = stream.get_final_message()
-    if message.stop_reason == "refusal":
-        raise RuntimeError("Claude declined to process this document.")
-    if message.stop_reason == "max_tokens":
-        raise RuntimeError(
-            "A page window exceeded the output limit even at 32k tokens. "
-            "Lower INGEST_PAGE_WINDOW (e.g. to 4) and re-ingest."
-        )
-    text = next((b.text for b in message.content if b.type == "text"), None)
-    if not text:
-        raise RuntimeError("No structured output returned from Claude.")
-    return text
+    def _call() -> str:
+        with _client.messages.stream(
+            model=MODEL,
+            max_tokens=32000,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[
+                {"role": "user", "content": [_document_block(pdf_bytes), {"type": "text", "text": prompt}]}
+            ],
+        ) as stream:
+            message = stream.get_final_message()
+        if message.stop_reason == "refusal":
+            raise RuntimeError("Claude declined to process this document.")
+        if message.stop_reason == "max_tokens":
+            raise RuntimeError(
+                "A page window exceeded the output limit even at 32k tokens. "
+                "Lower INGEST_PAGE_WINDOW (e.g. to 4) and re-ingest."
+            )
+        text = next((b.text for b in message.content if b.type == "text"), None)
+        if not text:
+            raise RuntimeError("No structured output returned from Claude.")
+        return text
+
+    return _with_retries(_call)
 
 
 # --- theory ingestion --------------------------------------------------------
@@ -162,7 +208,15 @@ _THEORY_PROMPT = (
     "grammar section whose text appears on these pages, using the book's EXACT "
     "decimal section numbers as printed (e.g. '12.3.2'). A section may be cut off "
     "at a page edge — extract whatever is present; partial sections will be merged "
-    "with the adjacent window. Do not invent section numbers.\n\n"
+    "with the adjacent window.\n\n"
+    "When a chapter OPENS with introductory material before its first numbered "
+    "subsection — the opening prose, a 'this chapter covers…' overview, or an "
+    "introductory table (e.g. Table 4.1) — capture it as ONE section whose `number` "
+    "is the bare chapter number (e.g. '4' for 'Chapter 4 The articles') and whose "
+    "`title` is the chapter's own title. Always emit this chapter-intro section when "
+    "such material is present, so a chapter's opening is never dropped. Apart from "
+    "this, do not invent section numbers — every other section must use a decimal "
+    "number printed in the book.\n\n"
     "Format the `rule` field as clean, readable Markdown that mirrors the book's layout:\n"
     "- Explanatory sentences are ordinary paragraphs.\n"
     "- Preserve the book's **bold**: wrap in `**…**` every word the book prints in "
@@ -230,7 +284,7 @@ def ingest_theory_pdf(pdf_bytes: bytes) -> dict[str, int]:
 
     from . import db
 
-    return db.replace_theory(list(chapters.values()), list(sections.values()))
+    return db.upsert_theory(list(chapters.values()), list(sections.values()))
 
 
 # --- practice ingestion ------------------------------------------------------
@@ -341,7 +395,7 @@ def ingest_practice_pdf(pdf_bytes: bytes) -> int:
 
     from . import db
 
-    return db.replace_practice(exercises)
+    return db.upsert_practice(exercises)
 
 
 # --- lookup ------------------------------------------------------------------
@@ -350,7 +404,7 @@ _ASK_SCHEMA = _strict_schema(AskResponse)
 
 
 def _catalogue(sections: list[GrammarSection]) -> str:
-    """Render the stored sections as the grounding catalogue passed to Claude."""
+    """Render the FULL text of the given sections — used for the few that are relevant."""
     return "\n\n".join(
         f"[{s.number}] {s.title}\n"
         f"Summary: {s.summary}\n"
@@ -358,6 +412,63 @@ def _catalogue(sections: list[GrammarSection]) -> str:
         f"Rule: {s.rule}"
         for s in sections
     )
+
+
+def _index(sections: list[GrammarSection]) -> str:
+    """A lightweight catalogue — number, title, summary, keywords, but NO rule text.
+
+    Small enough to send on every call so Claude can see what exists and pick the
+    relevant sections, rather than receiving the whole book's rules each time.
+    """
+    return "\n".join(
+        f"[{s.number}] {s.title} — {s.summary} (keywords: {', '.join(s.keywords) or '—'})"
+        for s in sections
+    )
+
+
+_SECTION_SELECT_SCHEMA = _strict_schema(SectionSelection)
+
+
+def _select_relevant(
+    query: str, sections: list[GrammarSection], *, limit: int = 8
+) -> list[GrammarSection]:
+    """Pick the sections relevant to a query from the index — one cheap Sonnet call.
+
+    Returns the matching sections (with full text), most relevant first, capped at
+    ``limit``. Empty when nothing is clearly relevant.
+    """
+    if not sections:
+        return []
+    by_number = {s.number: s for s in sections}
+    system = (
+        "You are routing a German grammar question to the right reference sections. From the "
+        "catalogue of Hammer's German Grammar and Usage sections below (number, title, summary, "
+        "keywords), pick the few whose rules are most relevant to the user's text — usually 1–5, "
+        f"at most {limit}, most relevant first. Use ONLY numbers that appear in the catalogue; "
+        "return an empty list if none are clearly relevant."
+    )
+    response = _client.messages.create(
+        model=READING_MODEL,
+        max_tokens=300,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": _SECTION_SELECT_SCHEMA}},
+        messages=[
+            {"role": "user", "content": f"Catalogue:\n\n{_index(sections)}\n\n---\n\nText: {query}"}
+        ],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        return []
+    selection = SectionSelection.model_validate(json.loads(out))
+    # Preserve the model's relevance order, skip unknown numbers, cap the count.
+    chosen: list[GrammarSection] = []
+    for number in selection.numbers:
+        section = by_number.get(number)
+        if section and section not in chosen:
+            chosen.append(section)
+        if len(chosen) >= limit:
+            break
+    return chosen
 
 
 def _ask_response(text: str) -> AskResponse:
@@ -372,7 +483,8 @@ def ask(query: str, sections: list[GrammarSection]) -> AskResponse:
             section_numbers=[],
         )
 
-    catalogue = _catalogue(sections)
+    relevant = _select_relevant(query, sections)
+    catalogue = _catalogue(relevant) if relevant else "(no clearly relevant sections found)"
 
     system = (
         "You are a German grammar tutor. The user gives you a word, phrase, or question. "
@@ -446,6 +558,9 @@ def explain_grammar(
             section_numbers=[],
         )
 
+    relevant = _select_relevant(f"{text}{_context_block(context)}", sections)
+    catalogue = _catalogue(relevant) if relevant else "(no clearly relevant sections found)"
+
     system = (
         "You are a German grammar tutor. The learner highlighted a word or phrase while "
         "reading and wants to understand the grammar at work in it — cases, endings, word "
@@ -463,7 +578,7 @@ def explain_grammar(
             {
                 "role": "user",
                 "content": (
-                    f"Available grammar sections:\n\n{_catalogue(sections)}\n\n---\n\n"
+                    f"Available grammar sections:\n\n{catalogue}\n\n---\n\n"
                     f"Selected text: {text}{_context_block(context)}"
                 ),
             }
@@ -479,7 +594,8 @@ def ask_free(
     text: str, question: str, context: str | None, sections: list[GrammarSection]
 ) -> AskResponse:
     """Answer a free-form question about a selection; cite sections when relevant."""
-    catalogue = _catalogue(sections) if sections else "(no grammar sections available)"
+    relevant = _select_relevant(f"{question}\n{text}{_context_block(context)}", sections)
+    catalogue = _catalogue(relevant) if relevant else "(no grammar sections available)"
     system = (
         "You are a helpful German tutor for someone reading a German book. Answer the "
         "learner's question about the highlighted text clearly and accurately. Grammar "
@@ -508,6 +624,153 @@ def ask_free(
     if not out:
         raise RuntimeError("No answer returned from Claude.")
     return _ask_response(out)
+
+
+# --- flashcards --------------------------------------------------------------
+#
+# A card is proposed from a reading selection: the model translates the sentence,
+# locates the English word that renders the highlighted German one, classifies it,
+# and offers a short Context Note only when a real grammar point applies. The
+# inflection it returns is then overridden, where possible, by the deterministic
+# Wiktionary dictionary so gender / plural / principal parts never rely on a guess.
+
+_CARD_SCHEMA = _strict_schema(CardSuggestion)
+
+
+# Wiktionary reports the perfect auxiliary as an infinitive ('sein'/'haben');
+# the card wants its 3rd-person-singular form, as it reads in 'ist gelaufen'.
+_AUX_3SG = {"sein": "ist", "haben": "hat"}
+
+
+def _merge_dictionary_facts(card: CardSuggestion) -> CardSuggestion:
+    """Override the suggested declension with sourced dictionary facts when available.
+
+    The dictionary is keyed by the *canonical* form, so we look up the lemma the
+    model proposed (a verb's infinitive, a noun without its article) rather than
+    the inflected surface word — 'erwachte' has no Wiktionary entry, 'erwachen'
+    does. Whatever it returns then corrects the model, including a wrong lemma.
+    """
+    entry = next((e for e in (dictionary.lookup(card.lemma), dictionary.lookup(card.target_de)) if e), None)
+    if entry is None:
+        return card
+
+    forms = {f.label: f.form for f in entry.forms}
+
+    if card.pos == "noun" and entry.part_of_speech == "noun":
+        if entry.gender:
+            card.declension.gender = entry.gender
+            # Keep the lemma article in sync with the sourced gender.
+            card.lemma = f"{entry.gender} {entry.word}"
+        if forms.get("plural"):
+            card.declension.plural = forms["plural"]
+    elif card.pos == "verb" and entry.part_of_speech == "verb":
+        card.declension.infinitive = entry.word
+        card.lemma = entry.word
+        if forms.get("preterite"):
+            card.declension.preterite = forms["preterite"]
+        participle = forms.get("past participle")
+        if participle:
+            auxiliary = _AUX_3SG.get((forms.get("auxiliary") or "haben").lower(), "hat")
+            card.declension.perfect = f"{auxiliary} {participle}"
+
+    return card
+
+
+def suggest_flashcard(german: str, target: str, english: str | None = None) -> CardSuggestion:
+    """Propose a short sentence flashcard for a highlighted German word."""
+    system = (
+        "You build German→English study flashcards for a learner reading a German book. "
+        "They highlighted one target word in a sentence; make a clean card that drills it:\n"
+        "- german: a SHORT German sentence (about 4–9 words) derived from the SOURCE — keep its structure "
+        "and reuse its own nouns and phrases, just TRIM it down to the clause around the target. Don't "
+        "paraphrase into unrelated vocabulary; a long literary sentence becomes a short version of itself, "
+        "using the same words where you can, with the target word still in it and its meaning unchanged.\n"
+        "- For a target verb in a past tense, prefer the PERFEKT — the conversational default in German "
+        "(e.g. 'Er ist aus unruhigen Träumen erwacht', not the Präteritum 'Er erwachte'). EXCEPTION: sein, "
+        "haben and the modal verbs stay in the Präteritum ('war', 'hatte', 'konnte'), as in real speech. "
+        "For a non-past target, keep the source's tense.\n"
+        "- english: a natural, faithful English translation of that short sentence (the card front).\n"
+        "- target_de: the target word/form to highlight, exactly as it appears in your german sentence; if "
+        "the Perfekt splits the verb across the clause, use the past participle (e.g. 'erwacht').\n"
+        "- target_en: the word or short phrase in your english sentence that renders the target.\n"
+        "- pos: 'noun', 'verb', or 'other'.\n"
+        "- lemma: the DICTIONARY form, never the inflected one — a noun WITH its article (e.g. 'das Gemüse'); "
+        "a verb's INFINITIVE (e.g. 'erwachte' → 'erwachen', 'lief' → 'laufen'). This is critical: reduce the "
+        "highlighted word to its base form.\n"
+        "- declension: for a noun fill gender ('der'/'die'/'das') and plural (the plural form, or '—' if none); "
+        "for a verb fill the three principal parts — infinitive, preterite (3rd person singular, e.g. 'lief'), "
+        "and perfect (3rd-person auxiliary + past participle, e.g. 'ist gelaufen'); leave the rest null.\n"
+        "- note: include ONE short Context Note (Markdown) ONLY when a genuinely instructive grammar point "
+        "applies to your sentence (a singular/plural mismatch with English, a zero article, a separable verb, "
+        "a tricky case). Otherwise return null. Do not pad.\n"
+        "Keep everything accurate; the gender, plural and verb parts may be corrected from a dictionary afterwards."
+    )
+    user = f"Source German sentence: {german}\nHighlighted target word: {target}"
+    if english:
+        user += f"\nThe book's English for the source: {english}"
+
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=1200,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": _CARD_SCHEMA}},
+        messages=[{"role": "user", "content": user}],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        raise RuntimeError("No flashcard returned from Claude.")
+    card = CardSuggestion.model_validate(json.loads(out))
+    return _merge_dictionary_facts(card)
+
+
+_ANSWER_CHECK_SCHEMA = _strict_schema(AnswerCheck)
+
+# Some models occasionally emit literal "ä" escape text instead of the
+# character itself; decode any that slip through so feedback renders cleanly.
+_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _decode_escapes(text: str) -> str:
+    return _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+
+
+def check_answer(
+    english: str, expected_german: str, answer: str, sections: list[GrammarSection]
+) -> AnswerCheck:
+    """Grade a learner's typed recall of a card, citing grammar sections when relevant."""
+    catalogue = _index(sections) if sections else "(no grammar sections available)"
+    system = (
+        "You are a warm, concise German tutor checking a learner's recall. They were shown an English "
+        "sentence and tried to write it in German from memory. You are given the English prompt, the "
+        "expected German sentence, the learner's attempt, and a catalogue of grammar sections.\n"
+        "Judge whether their attempt conveys the same meaning in grammatical German — accept any natural, "
+        "correct paraphrase, not only the expected wording. Set 'correct' accordingly. In 'feedback', start "
+        "by acknowledging what they got right, then point out each real mistake (wrong gender, adjective or "
+        "verb ending, case, word order, spelling) and give the correction. Be brief and encouraging; do not "
+        "nitpick stylistic choices that are already correct. Use Markdown, one short paragraph, and write all "
+        "characters directly as UTF-8 (ä, ö, ü, ß, —) — never \\uXXXX escapes.\n"
+        "When a mistake is explained by one of the provided grammar sections, list its decimal number in "
+        "section_numbers; use ONLY numbers from the catalogue, and leave the list empty if none apply."
+    )
+    user = (
+        f"Available grammar sections:\n\n{catalogue}\n\n---\n\n"
+        f"English prompt: {english}\n"
+        f"Expected German: {expected_german}\n"
+        f"Learner's attempt: {answer}"
+    )
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=900,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": _ANSWER_CHECK_SCHEMA}},
+        messages=[{"role": "user", "content": user}],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        raise RuntimeError("No answer check returned from Claude.")
+    check = AnswerCheck.model_validate(json.loads(out))
+    check.feedback = _decode_escapes(check.feedback)
+    return check
 
 
 # --- assessing exercise answers ----------------------------------------------
@@ -655,21 +918,25 @@ class _OutputLimitError(RuntimeError):
 
 def _stream_text(content: list[dict[str, Any]], schema: dict[str, Any]) -> str:
     """One streamed structured-output call returning the JSON text block."""
-    with _client.messages.stream(
-        model=READING_MODEL,
-        max_tokens=32000,
-        output_config={"format": {"type": "json_schema", "schema": schema}},
-        messages=[{"role": "user", "content": content}],
-    ) as stream:
-        message = stream.get_final_message()
-    if message.stop_reason == "refusal":
-        raise RuntimeError("Claude declined to process this text.")
-    if message.stop_reason == "max_tokens":
-        raise _OutputLimitError("output limit reached")
-    text = next((b.text for b in message.content if b.type == "text"), None)
-    if not text:
-        raise RuntimeError("No alignment returned from Claude.")
-    return text
+
+    def _call() -> str:
+        with _client.messages.stream(
+            model=READING_MODEL,
+            max_tokens=32000,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": content}],
+        ) as stream:
+            message = stream.get_final_message()
+        if message.stop_reason == "refusal":
+            raise RuntimeError("Claude declined to process this text.")
+        if message.stop_reason == "max_tokens":
+            raise _OutputLimitError("output limit reached")
+        text = next((b.text for b in message.content if b.type == "text"), None)
+        if not text:
+            raise RuntimeError("No alignment returned from Claude.")
+        return text
+
+    return _with_retries(_call)
 
 
 _LEMMA_ARTICLE = re.compile(r"^(the|a|an)\s+", re.IGNORECASE)

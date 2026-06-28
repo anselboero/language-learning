@@ -254,3 +254,116 @@ export async function deleteBook(id: number): Promise<void> {
     await fetch(`${API_BASE}/reading/books/${id}`, { method: "DELETE" }),
   );
 }
+
+// --- flashcards --------------------------------------------------------------
+
+export interface CardDeclension {
+  gender: string | null; // der / die / das (nouns)
+  plural: string | null; // plural form, or "—" when none (nouns)
+  infinitive: string | null; // verb principal parts
+  preterite: string | null;
+  perfect: string | null;
+}
+
+// An editable card before it is saved.
+export interface CardSuggestion {
+  english: string;
+  german: string;
+  target_de: string;
+  target_en: string;
+  pos: string; // "noun" | "verb" | "other"
+  lemma: string;
+  declension: CardDeclension;
+  note: string | null;
+  section_numbers: string[];
+}
+
+// The payload sent to save a card (suggestion minus nothing, plus provenance).
+export interface FlashcardData extends CardSuggestion {
+  book_id: number | null;
+}
+
+export interface Flashcard extends FlashcardData {
+  id: number;
+  due: string; // ISO date
+  interval: number;
+  ease: number;
+  reps: number;
+  lapses: number;
+  last_reviewed: string | null;
+  created_at: string;
+}
+
+export type Rating = "again" | "hard" | "good" | "easy";
+
+export async function generateFlashcard(
+  german: string,
+  target: string,
+  english?: string | null,
+): Promise<CardSuggestion> {
+  return unwrap(
+    await fetch(`${API_BASE}/flashcards/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ german, target, english: english ?? null }),
+    }),
+  );
+}
+
+export async function createFlashcard(card: FlashcardData): Promise<Flashcard> {
+  return unwrap(
+    await fetch(`${API_BASE}/flashcards`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(card),
+    }),
+  );
+}
+
+export async function listFlashcards(): Promise<Flashcard[]> {
+  return unwrap(await fetch(`${API_BASE}/flashcards`, { cache: "no-store" }));
+}
+
+export async function listDueFlashcards(): Promise<Flashcard[]> {
+  return unwrap(
+    await fetch(`${API_BASE}/flashcards/due`, { cache: "no-store" }),
+  );
+}
+
+export async function reviewFlashcard(
+  id: number,
+  rating: Rating,
+): Promise<Flashcard> {
+  return unwrap(
+    await fetch(`${API_BASE}/flashcards/${id}/review`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rating }),
+    }),
+  );
+}
+
+export interface AnswerCheck {
+  correct: boolean;
+  feedback: string; // Markdown
+  section_numbers: string[]; // grammar sections explaining the mistakes
+}
+
+export async function checkFlashcardAnswer(
+  id: number,
+  answer: string,
+): Promise<AnswerCheck> {
+  return unwrap(
+    await fetch(`${API_BASE}/flashcards/${id}/check`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answer }),
+    }),
+  );
+}
+
+export async function deleteFlashcard(id: number): Promise<void> {
+  await unwrap(
+    await fetch(`${API_BASE}/flashcards/${id}`, { method: "DELETE" }),
+  );
+}

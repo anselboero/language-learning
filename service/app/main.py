@@ -25,19 +25,26 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import claude_client, db, dictionary
+from . import claude_client, db, dictionary, srs
 from .models import (
     AskRequest,
     AskResponse,
     AssessmentResult,
     AssessRequest,
+    AnswerCheck,
+    AnswerCheckRequest,
     Book,
     BookDetail,
+    CardSuggestion,
+    CardSuggestRequest,
     ChapterWithSections,
     Exercise,
+    Flashcard,
+    FlashcardData,
     FreeAskRequest,
     GrammarContextRequest,
     GrammarSection,
+    ReviewRequest,
     TranslateRequest,
     TranslateResponse,
 )
@@ -227,4 +234,60 @@ def reading_book(book_id: int) -> BookDetail:
 def delete_reading_book(book_id: int) -> dict[str, bool]:
     if not db.delete_book(book_id):
         raise HTTPException(404, "Book not found.")
+    return {"deleted": True}
+
+
+# --- flashcards --------------------------------------------------------------
+
+
+@app.post("/flashcards/generate", response_model=CardSuggestion)
+def generate_flashcard(req: CardSuggestRequest) -> CardSuggestion:
+    """Propose an editable card for a highlighted word; nothing is persisted yet."""
+    try:
+        return claude_client.suggest_flashcard(req.german, req.target, req.english)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Card generation failed: {exc}") from exc
+
+
+@app.post("/flashcards", response_model=Flashcard)
+def create_flashcard(card: FlashcardData) -> Flashcard:
+    return db.create_flashcard(card)
+
+
+@app.get("/flashcards", response_model=list[Flashcard])
+def list_flashcards() -> list[Flashcard]:
+    return db.list_flashcards()
+
+
+@app.get("/flashcards/due", response_model=list[Flashcard])
+def due_flashcards() -> list[Flashcard]:
+    return db.list_due_flashcards(srs._today().isoformat())
+
+
+@app.post("/flashcards/{card_id}/review", response_model=Flashcard)
+def review_flashcard(card_id: int, req: ReviewRequest) -> Flashcard:
+    try:
+        updated = db.review_flashcard(card_id, req.rating)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not updated:
+        raise HTTPException(404, "Flashcard not found.")
+    return updated
+
+
+@app.post("/flashcards/{card_id}/check", response_model=AnswerCheck)
+def check_flashcard_answer(card_id: int, req: AnswerCheckRequest) -> AnswerCheck:
+    card = db.get_flashcard(card_id)
+    if not card:
+        raise HTTPException(404, "Flashcard not found.")
+    try:
+        return claude_client.check_answer(card.english, card.german, req.answer, db.list_sections())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Answer check failed: {exc}") from exc
+
+
+@app.delete("/flashcards/{card_id}")
+def delete_flashcard(card_id: int) -> dict[str, bool]:
+    if not db.delete_flashcard(card_id):
+        raise HTTPException(404, "Flashcard not found.")
     return {"deleted": True}

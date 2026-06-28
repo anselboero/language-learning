@@ -146,6 +146,20 @@ class AskResponse(BaseModel):
     )
 
 
+class SectionSelection(BaseModel):
+    """Which sections a lightweight index call judged relevant to a query.
+
+    Used to retrieve only the handful of full grammar rules worth sending to the
+    explanation call, instead of the whole book's text every time.
+    """
+
+    numbers: list[str] = Field(
+        default_factory=list,
+        description="Decimal section numbers relevant to the query, most relevant first; "
+        "use only numbers present in the index, and return an empty list if none apply.",
+    )
+
+
 # --- Selection: translate / dictionary ---------------------------------------
 #
 # When the learner highlights a span while reading, the client offers three
@@ -334,3 +348,127 @@ class Book(BaseModel):
 
 class BookDetail(Book):
     segments: list[ReadingSegment] = Field(default_factory=list)
+
+
+# --- Flashcards: sentence cards with one target word -------------------------
+#
+# A card built from a reading selection: an English/German sentence pair with one
+# word highlighted, whose inflection the learner recalls. For a noun that's the
+# gender + plural; for a verb the three principal parts (Stammformen). An optional
+# Context Note carries a short grammar point when one genuinely applies. Cards are
+# scheduled in-app with an SM-2 spaced-repetition state (see ``srs.py``).
+
+
+class CardDeclension(BaseModel):
+    """The inflection the learner is tested on for the card's target word.
+
+    Only the fields relevant to ``pos`` are filled: noun → gender + plural,
+    verb → the three principal parts. ``other`` parts of speech leave all null.
+    """
+
+    gender: Optional[str] = Field(
+        default=None, description="Noun article: 'der' | 'die' | 'das'."
+    )
+    plural: Optional[str] = Field(
+        default=None,
+        description="The noun's plural form, or '—' when it has no distinct plural.",
+    )
+    infinitive: Optional[str] = Field(default=None, description="Verb infinitive, e.g. 'laufen'.")
+    preterite: Optional[str] = Field(
+        default=None, description="Verb 3rd-person-singular preterite, e.g. 'lief'."
+    )
+    perfect: Optional[str] = Field(
+        default=None,
+        description="Verb perfect with auxiliary + past participle, e.g. 'ist gelaufen'.",
+    )
+
+
+class CardSuggestion(BaseModel):
+    """A proposed flashcard for a selection, before the learner saves it.
+
+    The prose fields come from Claude; the deterministic declension facts are
+    overridden by the Wiktionary dictionary when it resolves the word.
+    """
+
+    english: str = Field(description="Natural English translation of the whole sentence (the card front).")
+    german: str = Field(description="The German sentence, verbatim (the card back).")
+    target_de: str = Field(description="The German target word as it appears in the sentence, to highlight.")
+    target_en: str = Field(description="The English word(s) in the translation that render the target, to highlight.")
+    pos: str = Field(description="Part of speech of the target: 'noun' | 'verb' | 'other'.")
+    lemma: str = Field(
+        description="Dictionary form of the target: a noun with its article ('das Gemüse') or a verb infinitive ('mögen')."
+    )
+    declension: CardDeclension = Field(
+        default_factory=CardDeclension,
+        description="Inflection to test: gender+plural for nouns, the three principal parts for verbs.",
+    )
+    note: Optional[str] = Field(
+        default=None,
+        description="One short Context Note (Markdown) on a genuinely instructive grammar point, or null if none applies.",
+    )
+    section_numbers: list[str] = Field(
+        default_factory=list, description="Grammar section numbers the note draws on, if any."
+    )
+
+
+class CardSuggestRequest(BaseModel):
+    german: str = Field(description="The enclosing German sentence.")
+    target: str = Field(description="The German word/phrase the learner highlighted.")
+    english: Optional[str] = Field(
+        default=None, description="The known English sentence, if the reader already has it."
+    )
+
+
+class FlashcardData(BaseModel):
+    """A card the learner has chosen to save (the editable suggestion)."""
+
+    book_id: Optional[int] = Field(default=None, description="The reading book this card came from, if any.")
+    english: str
+    german: str
+    target_de: str
+    target_en: str
+    pos: str
+    lemma: str
+    declension: CardDeclension = Field(default_factory=CardDeclension)
+    note: Optional[str] = None
+    section_numbers: list[str] = Field(default_factory=list)
+
+
+class Flashcard(FlashcardData):
+    """A stored card plus its spaced-repetition scheduling state."""
+
+    id: int
+    due: str = Field(description="ISO date (YYYY-MM-DD) the card is next due for review.")
+    interval: float = Field(description="Current inter-review interval in days.")
+    ease: float = Field(description="SM-2 ease factor (>= 1.3).")
+    reps: int = Field(description="Successful reviews in a row.")
+    lapses: int = Field(description="Times the card was forgotten (rated 'again').")
+    last_reviewed: Optional[str] = Field(default=None, description="ISO datetime of the last review, or null.")
+    created_at: str = Field(description="ISO datetime the card was created.")
+
+
+class ReviewRequest(BaseModel):
+    rating: str = Field(description="The learner's grade: 'again' | 'hard' | 'good' | 'easy'.")
+
+
+class AnswerCheckRequest(BaseModel):
+    answer: str = Field(description="The German sentence the learner typed from memory.")
+
+
+class AnswerCheck(BaseModel):
+    """Claude's assessment of a learner's typed recall of a card."""
+
+    correct: bool = Field(
+        description="True if the answer conveys the same meaning in grammatical German "
+        "(an acceptable paraphrase counts), even if it isn't word-for-word the expected sentence."
+    )
+    feedback: str = Field(
+        description="Brief, encouraging Markdown feedback: what was right, then any mistakes "
+        "(gender, ending, case, word order, spelling) with the correction. One short paragraph. "
+        "Write all characters directly as UTF-8 (ä, ö, ü, ß, —); never use \\uXXXX escapes."
+    )
+    section_numbers: list[str] = Field(
+        default_factory=list,
+        description="Decimal grammar section numbers (from the provided sections only) whose rules "
+        "explain the learner's mistakes, e.g. ['2.1', '21.2']. Empty if none apply.",
+    )
