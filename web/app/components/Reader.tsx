@@ -14,12 +14,25 @@ interface Selected {
 export default function Reader({ book }: { book: BookDetail }) {
   const [density, setDensity] = useState(0.2);
   const [selected, setSelected] = useState<Selected | null>(null);
+  const [revealed, setRevealed] = useState<Set<number>>(new Set());
+
+  // At the top of the slider, weaving content words still leaves an English
+  // skeleton (function words never become German), so 100% shows the real,
+  // verbatim German prose instead — tap a line to reveal its English.
+  const fullGerman = density >= 1;
 
   // A word is woven into German once its frequency rank falls under the threshold.
   // rank 0 is the most frequent word, so low density still weaves the words you
   // meet most often — maximizing exposure.
   const threshold = Math.round(density * book.vocab_size);
   const isWoven = (c: WeaveChunk) => c.de != null && c.rank != null && c.rank < threshold;
+
+  const toggleReveal = (seq: number) =>
+    setRevealed((prev) => {
+      const next = new Set(prev);
+      next.has(seq) ? next.delete(seq) : next.add(seq);
+      return next;
+    });
 
   const wovenCount = useMemo(
     () =>
@@ -49,34 +62,50 @@ export default function Reader({ book }: { book: BookDetail }) {
           <span className="density-pct">{Math.round(density * 100)}%</span>
         </div>
         <p className="muted" style={{ margin: "0.4rem 0 0", fontSize: "0.85rem" }}>
-          {threshold} of {book.vocab_size} words active · {wovenCount} German words on the page
+          {fullGerman
+            ? "Full German text · tap a line to reveal the English"
+            : `${threshold} of ${book.vocab_size} words active · ${wovenCount} German words on the page`}
         </p>
       </div>
 
       <div className="reader-text">
-        {book.segments.map((seg) => (
-          <p key={seg.seq}>
-            {seg.chunks.map((c, i) => {
-              if (!isWoven(c)) return <span key={i}>{c.text}</span>;
-              // The model may bake surrounding spaces into the chunk's English
-              // text; keep them around the German so words don't run together.
-              const lead = c.text.slice(0, c.text.length - c.text.trimStart().length);
-              const trail = c.text.slice(c.text.trimEnd().length);
-              return (
-                <span key={i}>
-                  {lead}
-                  <span
-                    className="woven"
-                    onClick={() => setSelected({ de: c.de!, en: c.text, gloss: c.gloss })}
-                  >
-                    {c.de}
+        {book.segments.map((seg) =>
+          fullGerman ? (
+            <p
+              key={seg.seq}
+              className="full-de"
+              onClick={() => toggleReveal(seg.seq)}
+              title="Tap to reveal the English"
+            >
+              {seg.german}
+              {revealed.has(seg.seq) && (
+                <span className="reveal-en"> — {seg.english}</span>
+              )}
+            </p>
+          ) : (
+            <p key={seg.seq}>
+              {seg.chunks.map((c, i) => {
+                if (!isWoven(c)) return <span key={i}>{c.text}</span>;
+                // The model may bake surrounding spaces into the chunk's English
+                // text; keep them around the German so words don't run together.
+                const lead = c.text.slice(0, c.text.length - c.text.trimStart().length);
+                const trail = c.text.slice(c.text.trimEnd().length);
+                return (
+                  <span key={i}>
+                    {lead}
+                    <span
+                      className="woven"
+                      onClick={() => setSelected({ de: c.de!, en: c.text, gloss: c.gloss })}
+                    >
+                      {c.de}
+                    </span>
+                    {trail}
                   </span>
-                  {trail}
-                </span>
-              );
-            })}
-          </p>
-        ))}
+                );
+              })}
+            </p>
+          ),
+        )}
       </div>
 
       {selected && <WordInspector word={selected} onClose={() => setSelected(null)} />}

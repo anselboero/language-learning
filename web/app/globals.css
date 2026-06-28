@@ -291,6 +291,14 @@ textarea {
   text-decoration: underline;
 }
 
+.full-de {
+  cursor: pointer;
+}
+.reveal-en {
+  color: var(--muted);
+  font-style: italic;
+}
+
 .inspector {
   position: sticky;
   bottom: 1rem;
