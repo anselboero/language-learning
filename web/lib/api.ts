@@ -43,6 +43,28 @@ export interface AskResponse {
   section_numbers: string[];
 }
 
+export interface WordForm {
+  label: string;
+  form: string;
+}
+
+export interface DictionaryEntry {
+  word: string;
+  part_of_speech: string;
+  gender: string | null; // display article: der / die / das
+  gender_label: string | null; // masculine / feminine / neuter
+  pronunciation: string | null;
+  forms: WordForm[];
+  definitions: string[];
+  source_url: string | null;
+}
+
+export interface TranslateResponse {
+  translation: string;
+  note: string | null;
+  dictionary: DictionaryEntry | null;
+}
+
 export interface ItemAssessment {
   index: number;
   correct: boolean;
@@ -155,6 +177,48 @@ export async function askClaude(query: string): Promise<AskResponse> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query }),
+    }),
+  );
+}
+
+// --- selection actions -------------------------------------------------------
+
+export async function translateSelection(
+  text: string,
+  context?: string | null,
+): Promise<TranslateResponse> {
+  return unwrap(
+    await fetch(`${API_BASE}/selection/translate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, context: context ?? null }),
+    }),
+  );
+}
+
+export async function grammarContext(
+  text: string,
+  context?: string | null,
+): Promise<AskResponse> {
+  return unwrap(
+    await fetch(`${API_BASE}/selection/grammar`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, context: context ?? null }),
+    }),
+  );
+}
+
+export async function askAboutSelection(
+  text: string,
+  question: string,
+  context?: string | null,
+): Promise<AskResponse> {
+  return unwrap(
+    await fetch(`${API_BASE}/selection/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, question, context: context ?? null }),
     }),
   );
 }

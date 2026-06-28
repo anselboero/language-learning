@@ -146,6 +146,78 @@ class AskResponse(BaseModel):
     )
 
 
+# --- Selection: translate / dictionary ---------------------------------------
+#
+# When the learner highlights a span while reading, the client offers three
+# actions on it: a plain translation (Sonnet), a grounded grammar explanation,
+# and a free-form question. The translation is enriched, for single-word
+# selections, with deterministic dictionary facts from a Wiktionary-backed API
+# so gender / plural / verb forms never depend on the model.
+
+
+class WordForm(BaseModel):
+    """A single labelled inflected form, e.g. label='plural', form='Häuser'."""
+
+    label: str
+    form: str
+
+
+class DictionaryEntry(BaseModel):
+    """Deterministic grammatical facts for one German word (no model involved)."""
+
+    word: str = Field(description="The headword that was looked up.")
+    part_of_speech: str
+    gender: Optional[str] = Field(
+        default=None, description="Display article for a noun: 'der' | 'die' | 'das'."
+    )
+    gender_label: Optional[str] = Field(
+        default=None, description="'masculine' | 'feminine' | 'neuter', if known."
+    )
+    pronunciation: Optional[str] = Field(default=None, description="IPA, if available.")
+    forms: list[WordForm] = Field(
+        default_factory=list,
+        description="Key forms: plural/genitive for nouns, principal parts for verbs, etc.",
+    )
+    definitions: list[str] = Field(default_factory=list)
+    source_url: Optional[str] = None
+
+
+class SelectionTranslation(BaseModel):
+    """Claude's structured output for a selection translation."""
+
+    translation: str = Field(description="Faithful, natural English translation of the German text.")
+    note: Optional[str] = Field(
+        default=None,
+        description="One brief usage note (idiom, case, separable verb, register) if helpful, else null.",
+    )
+
+
+class TranslateRequest(BaseModel):
+    text: str = Field(description="The German text the learner selected.")
+    context: Optional[str] = Field(
+        default=None, description="The enclosing German sentence, for disambiguation."
+    )
+
+
+class TranslateResponse(BaseModel):
+    translation: str
+    note: Optional[str] = None
+    dictionary: Optional[DictionaryEntry] = Field(
+        default=None, description="Dictionary facts when the selection is a single word."
+    )
+
+
+class GrammarContextRequest(BaseModel):
+    text: str = Field(description="The German text the learner selected.")
+    context: Optional[str] = Field(default=None, description="The enclosing German sentence.")
+
+
+class FreeAskRequest(BaseModel):
+    text: str = Field(description="The German text the learner selected.")
+    question: str = Field(description="The learner's free-form question about it.")
+    context: Optional[str] = Field(default=None, description="The enclosing German sentence.")
+
+
 # --- Assessing exercise answers ----------------------------------------------
 
 

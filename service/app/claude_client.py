@@ -34,6 +34,7 @@ from .models import (
     GrammarSection,
     GrammarSectionData,
     ReadingSegment,
+    SelectionTranslation,
     StoredChunk,
     SubmittedAnswer,
 )
@@ -348,6 +349,21 @@ def ingest_practice_pdf(pdf_bytes: bytes) -> int:
 _ASK_SCHEMA = _strict_schema(AskResponse)
 
 
+def _catalogue(sections: list[GrammarSection]) -> str:
+    """Render the stored sections as the grounding catalogue passed to Claude."""
+    return "\n\n".join(
+        f"[{s.number}] {s.title}\n"
+        f"Summary: {s.summary}\n"
+        f"Keywords: {', '.join(s.keywords) or '—'}\n"
+        f"Rule: {s.rule}"
+        for s in sections
+    )
+
+
+def _ask_response(text: str) -> AskResponse:
+    return AskResponse.model_validate(json.loads(text))
+
+
 def ask(query: str, sections: list[GrammarSection]) -> AskResponse:
     """Answer a word/free-text grammar question grounded in the stored sections."""
     if not sections:
@@ -356,13 +372,7 @@ def ask(query: str, sections: list[GrammarSection]) -> AskResponse:
             section_numbers=[],
         )
 
-    catalogue = "\n\n".join(
-        f"[{s.number}] {s.title}\n"
-        f"Summary: {s.summary}\n"
-        f"Keywords: {', '.join(s.keywords) or '—'}\n"
-        f"Rule: {s.rule}"
-        for s in sections
-    )
+    catalogue = _catalogue(sections)
 
     system = (
         "You are a German grammar tutor. The user gives you a word, phrase, or question. "
@@ -388,7 +398,116 @@ def ask(query: str, sections: list[GrammarSection]) -> AskResponse:
     text = next((b.text for b in response.content if b.type == "text"), None)
     if not text:
         raise RuntimeError("No answer returned from Claude.")
-    return AskResponse.model_validate(json.loads(text))
+    return _ask_response(text)
+
+
+# --- selection: translate / grammar context / free question ------------------
+#
+# Three actions a learner can take on a span they highlighted while reading. The
+# selected text plus its enclosing German sentence are passed so the model
+# disambiguates the same word across contexts.
+
+_TRANSLATE_SELECTION_SCHEMA = _strict_schema(SelectionTranslation)
+
+
+def _context_block(context: str | None) -> str:
+    return f"\n\nIt appears in this sentence:\n{context}" if context else ""
+
+
+def translate_selection(text: str, context: str | None = None) -> SelectionTranslation:
+    """Translate a highlighted German span to English (cheap reading model)."""
+    system = (
+        "You are a German→English translator for someone reading a German book. "
+        "Translate the given German text into natural, faithful English. If a short "
+        "usage note would genuinely help the learner (an idiom, a separable verb, a "
+        "case-governed meaning, or register), add ONE brief note; otherwise leave it "
+        "empty. Do not pad the translation with commentary."
+    )
+    response = _client.messages.create(
+        model=READING_MODEL,
+        max_tokens=800,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": _TRANSLATE_SELECTION_SCHEMA}},
+        messages=[{"role": "user", "content": f"German text: {text}{_context_block(context)}"}],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        raise RuntimeError("No translation returned from Claude.")
+    return SelectionTranslation.model_validate(json.loads(out))
+
+
+def explain_grammar(
+    text: str, context: str | None, sections: list[GrammarSection]
+) -> AskResponse:
+    """Explain the grammar of a selection, grounded strictly in stored sections."""
+    if not sections:
+        return AskResponse(
+            answer="No grammar has been ingested yet. Upload the theory PDF first.",
+            section_numbers=[],
+        )
+
+    system = (
+        "You are a German grammar tutor. The learner highlighted a word or phrase while "
+        "reading and wants to understand the grammar at work in it — cases, endings, word "
+        "order, verb forms, articles. Using ONLY the grammar sections provided (from "
+        "Hammer's German Grammar and Usage), explain the rule(s) that apply in clear plain "
+        "language and cite the decimal section numbers you relied on. If nothing in the "
+        "provided sections is relevant, say so honestly and return an empty section_numbers list."
+    )
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=2000,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": _ASK_SCHEMA}},
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Available grammar sections:\n\n{_catalogue(sections)}\n\n---\n\n"
+                    f"Selected text: {text}{_context_block(context)}"
+                ),
+            }
+        ],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        raise RuntimeError("No explanation returned from Claude.")
+    return _ask_response(out)
+
+
+def ask_free(
+    text: str, question: str, context: str | None, sections: list[GrammarSection]
+) -> AskResponse:
+    """Answer a free-form question about a selection; cite sections when relevant."""
+    catalogue = _catalogue(sections) if sections else "(no grammar sections available)"
+    system = (
+        "You are a helpful German tutor for someone reading a German book. Answer the "
+        "learner's question about the highlighted text clearly and accurately. Grammar "
+        "sections from Hammer's German Grammar and Usage are provided: when your answer "
+        "relies on one, cite its decimal section number; but you are NOT limited to them — "
+        "answer the question fully even when no section applies, leaving section_numbers "
+        "empty in that case. Be concise and concrete."
+    )
+    response = _client.messages.create(
+        model=MODEL,
+        max_tokens=2000,
+        system=system,
+        output_config={"format": {"type": "json_schema", "schema": _ASK_SCHEMA}},
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    f"Available grammar sections:\n\n{catalogue}\n\n---\n\n"
+                    f"Selected text: {text}{_context_block(context)}\n\n"
+                    f"Learner's question: {question}"
+                ),
+            }
+        ],
+    )
+    out = next((b.text for b in response.content if b.type == "text"), None)
+    if not out:
+        raise RuntimeError("No answer returned from Claude.")
+    return _ask_response(out)
 
 
 # --- assessing exercise answers ----------------------------------------------

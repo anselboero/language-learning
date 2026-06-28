@@ -8,6 +8,9 @@ Endpoints:
   GET  /sections/{number}         one section
   GET  /sections/{number}/exercises   practice exercises that drill this section
   POST /ask                       word / free-text lookup against the stored grammar
+  POST /selection/translate       translate a highlighted span (+ dictionary facts)
+  POST /selection/grammar         grammar explanation of a span, grounded in sections
+  POST /selection/ask             free-form question about a span, citing sections
   POST /reading/ingest            turn a German text (English optional) into a diglot book
   GET  /reading/books             list ingested reading books
   GET  /reading/books/{id}        one book with its aligned, weave-ready segments
@@ -22,7 +25,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import claude_client, db
+from . import claude_client, db, dictionary
 from .models import (
     AskRequest,
     AskResponse,
@@ -32,7 +35,11 @@ from .models import (
     BookDetail,
     ChapterWithSections,
     Exercise,
+    FreeAskRequest,
+    GrammarContextRequest,
     GrammarSection,
+    TranslateRequest,
+    TranslateResponse,
 )
 
 app = FastAPI(title="Language Learning — Grammar Service")
@@ -127,6 +134,39 @@ def assess(exercise_id: int, req: AssessRequest) -> AssessmentResult:
 def ask(req: AskRequest) -> AskResponse:
     try:
         return claude_client.ask(req.query, db.list_sections())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Lookup failed: {exc}") from exc
+
+
+# --- selection actions (translate / grammar context / free question) ---------
+
+
+@app.post("/selection/translate", response_model=TranslateResponse)
+def selection_translate(req: TranslateRequest) -> TranslateResponse:
+    try:
+        out = claude_client.translate_selection(req.text, req.context)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Translation failed: {exc}") from exc
+    # Dictionary facts are best-effort and only apply to single words; never fatal.
+    return TranslateResponse(
+        translation=out.translation,
+        note=out.note,
+        dictionary=dictionary.lookup(req.text),
+    )
+
+
+@app.post("/selection/grammar", response_model=AskResponse)
+def selection_grammar(req: GrammarContextRequest) -> AskResponse:
+    try:
+        return claude_client.explain_grammar(req.text, req.context, db.list_sections())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Lookup failed: {exc}") from exc
+
+
+@app.post("/selection/ask", response_model=AskResponse)
+def selection_ask(req: FreeAskRequest) -> AskResponse:
+    try:
+        return claude_client.ask_free(req.text, req.question, req.context, db.list_sections())
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Lookup failed: {exc}") from exc
 

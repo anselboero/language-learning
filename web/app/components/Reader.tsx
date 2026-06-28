@@ -2,18 +2,31 @@
 
 import { useMemo, useState } from "react";
 import Link from "next/link";
-import { askClaude, type AskResponse, type BookDetail, type WeaveChunk } from "@/lib/api";
+import {
+  askAboutSelection,
+  grammarContext,
+  translateSelection,
+  type AskResponse,
+  type BookDetail,
+  type DictionaryEntry,
+  type TranslateResponse,
+  type WeaveChunk,
+} from "@/lib/api";
 import Markdown from "./Markdown";
 
-interface Selected {
-  de: string;
-  en: string;
-  gloss: string | null;
+// What the inspector acts on: a German word or phrase, plus optional surface
+// info (filled when it came from tapping a woven word) and the enclosing German
+// sentence used as context for translation / grammar / questions.
+interface Subject {
+  text: string;
+  en?: string | null;
+  gloss?: string | null;
+  context?: string | null;
 }
 
 export default function Reader({ book }: { book: BookDetail }) {
   const [density, setDensity] = useState(0.2);
-  const [selected, setSelected] = useState<Selected | null>(null);
+  const [subject, setSubject] = useState<Subject | null>(null);
   const [revealed, setRevealed] = useState<Set<number>>(new Set());
 
   // At the top of the slider, weaving content words still leaves an English
@@ -33,6 +46,16 @@ export default function Reader({ book }: { book: BookDetail }) {
       next.has(seq) ? next.delete(seq) : next.add(seq);
       return next;
     });
+
+  // Open the inspector on whatever German the reader highlighted, using the
+  // segment's German sentence as context. Returns whether a selection was found,
+  // so callers can suppress a competing click (e.g. the reveal toggle).
+  const captureSelection = (context: string): boolean => {
+    const text = window.getSelection()?.toString().trim();
+    if (!text) return false;
+    setSubject({ text, context });
+    return true;
+  };
 
   const wovenCount = useMemo(
     () =>
@@ -55,7 +78,7 @@ export default function Reader({ book }: { book: BookDetail }) {
             max={100}
             value={Math.round(density * 100)}
             onChange={(e) => {
-              setSelected(null);
+              setSubject(null);
               setDensity(Number(e.target.value) / 100);
             }}
           />
@@ -63,8 +86,8 @@ export default function Reader({ book }: { book: BookDetail }) {
         </div>
         <p className="muted" style={{ margin: "0.4rem 0 0", fontSize: "0.85rem" }}>
           {fullGerman
-            ? "Full German text · tap a line to reveal the English"
-            : `${threshold} of ${book.vocab_size} words active · ${wovenCount} German words on the page`}
+            ? "Full German text · select any phrase to look it up · tap a line to reveal the English"
+            : `${threshold} of ${book.vocab_size} words active · ${wovenCount} German words on the page · select German to look it up`}
         </p>
       </div>
 
@@ -74,8 +97,13 @@ export default function Reader({ book }: { book: BookDetail }) {
             <p
               key={seg.seq}
               className="full-de"
-              onClick={() => toggleReveal(seg.seq)}
-              title="Tap to reveal the English"
+              onMouseUp={() => captureSelection(seg.german)}
+              onClick={() => {
+                // A drag to select text also fires click; don't toggle then.
+                if (window.getSelection()?.toString().trim()) return;
+                toggleReveal(seg.seq);
+              }}
+              title="Tap to reveal the English · select text to look it up"
             >
               {seg.german}
               {revealed.has(seg.seq) && (
@@ -83,7 +111,7 @@ export default function Reader({ book }: { book: BookDetail }) {
               )}
             </p>
           ) : (
-            <p key={seg.seq}>
+            <p key={seg.seq} onMouseUp={() => captureSelection(seg.german)}>
               {seg.chunks.map((c, i) => {
                 if (!isWoven(c)) return <span key={i}>{c.text}</span>;
                 // The model may bake surrounding spaces into the chunk's English
@@ -95,7 +123,11 @@ export default function Reader({ book }: { book: BookDetail }) {
                     {lead}
                     <span
                       className="woven"
-                      onClick={() => setSelected({ de: c.de!, en: c.text, gloss: c.gloss })}
+                      onClick={() => {
+                        // A click is a collapsed selection; inspect the word itself.
+                        if (window.getSelection()?.toString().trim()) return;
+                        setSubject({ text: c.de!, en: c.text, gloss: c.gloss, context: seg.german });
+                      }}
                     >
                       {c.de}
                     </span>
@@ -108,26 +140,46 @@ export default function Reader({ book }: { book: BookDetail }) {
         )}
       </div>
 
-      {selected && <WordInspector word={selected} onClose={() => setSelected(null)} />}
+      {subject && (
+        <Inspector
+          key={`${subject.text}|${subject.en ?? ""}`}
+          subject={subject}
+          onClose={() => setSubject(null)}
+        />
+      )}
     </>
   );
 }
 
-function WordInspector({ word, onClose }: { word: Selected; onClose: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [grammar, setGrammar] = useState<AskResponse | null>(null);
+type Action = "translate" | "grammar" | "ask";
 
-  async function explain() {
-    setBusy(true);
-    setGrammar(null);
+function Inspector({ subject, onClose }: { subject: Subject; onClose: () => void }) {
+  const [busy, setBusy] = useState<Action | null>(null);
+  const [translation, setTranslation] = useState<TranslateResponse | null>(null);
+  const [grammar, setGrammar] = useState<AskResponse | null>(null);
+  const [answer, setAnswer] = useState<AskResponse | null>(null);
+  const [asking, setAsking] = useState(false);
+  const [question, setQuestion] = useState("");
+
+  async function run<T>(action: Action, fn: () => Promise<T>, set: (v: T) => void) {
+    setBusy(action);
     try {
-      setGrammar(await askClaude(word.de));
+      set(await fn());
     } catch {
-      /* keep the inspector usable even if the lookup fails */
+      /* keep the inspector usable even if a lookup fails */
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
+
+  const doTranslate = () =>
+    run("translate", () => translateSelection(subject.text, subject.context), setTranslation);
+  const doGrammar = () =>
+    run("grammar", () => grammarContext(subject.text, subject.context), setGrammar);
+  const doAsk = () => {
+    if (!question.trim()) return;
+    return run("ask", () => askAboutSelection(subject.text, question, subject.context), setAnswer);
+  };
 
   return (
     <div className="inspector">
@@ -135,27 +187,120 @@ function WordInspector({ word, onClose }: { word: Selected; onClose: () => void 
         ✕
       </button>
       <p className="inspector-head">
-        <strong>{word.de}</strong> <span className="muted">→ {word.en.trim()}</span>
+        <strong>{subject.text.trim()}</strong>
+        {subject.en && <span className="muted"> → {subject.en.trim()}</span>}
       </p>
-      {word.gloss && <p className="muted" style={{ margin: "0 0 0.6rem" }}>{word.gloss}</p>}
-      <button onClick={explain} disabled={busy}>
-        {busy ? "Looking up…" : "Explain the grammar"}
-      </button>
+      {subject.gloss && <p className="muted" style={{ margin: "0 0 0.6rem" }}>{subject.gloss}</p>}
+
+      <div className="inspector-actions">
+        <button onClick={doTranslate} disabled={busy !== null}>
+          {busy === "translate" ? "Translating…" : "Translate"}
+        </button>
+        <button onClick={doGrammar} disabled={busy !== null}>
+          {busy === "grammar" ? "Looking up…" : "Grammar context"}
+        </button>
+        <button onClick={() => setAsking((v) => !v)} disabled={busy !== null}>
+          Ask Claude
+        </button>
+      </div>
+
+      {translation && (
+        <div className="answer" style={{ marginTop: "0.8rem" }}>
+          <p style={{ margin: 0 }}>{translation.translation}</p>
+          {translation.note && (
+            <p className="muted" style={{ margin: "0.5rem 0 0", fontSize: "0.9rem" }}>
+              {translation.note}
+            </p>
+          )}
+          {translation.dictionary && <DictionaryCard entry={translation.dictionary} />}
+        </div>
+      )}
+
       {grammar && (
         <div className="answer" style={{ marginTop: "0.8rem" }}>
           <Markdown>{grammar.answer}</Markdown>
-          {grammar.section_numbers.length > 0 && (
-            <p className="muted" style={{ marginBottom: 0 }}>
-              Referenced:{" "}
-              {grammar.section_numbers.map((num, i) => (
-                <span key={num}>
-                  {i > 0 && ", "}
-                  <Link href={`/sections/${encodeURIComponent(num)}`}>§{num}</Link>
-                </span>
-              ))}
-            </p>
-          )}
+          <SectionRefs numbers={grammar.section_numbers} />
         </div>
+      )}
+
+      {asking && (
+        <form
+          className="ask-row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            doAsk();
+          }}
+        >
+          <input
+            type="text"
+            placeholder="Ask anything about this…"
+            value={question}
+            onChange={(e) => setQuestion(e.target.value)}
+            autoFocus
+          />
+          <button type="submit" disabled={busy !== null || !question.trim()}>
+            {busy === "ask" ? "Asking…" : "Ask"}
+          </button>
+        </form>
+      )}
+
+      {answer && (
+        <div className="answer" style={{ marginTop: "0.8rem" }}>
+          <Markdown>{answer.answer}</Markdown>
+          <SectionRefs numbers={answer.section_numbers} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SectionRefs({ numbers }: { numbers: string[] }) {
+  if (numbers.length === 0) return null;
+  return (
+    <p className="muted" style={{ marginBottom: 0 }}>
+      Referenced:{" "}
+      {numbers.map((num, i) => (
+        <span key={num}>
+          {i > 0 && ", "}
+          <Link href={`/sections/${encodeURIComponent(num)}`}>§{num}</Link>
+        </span>
+      ))}
+    </p>
+  );
+}
+
+function DictionaryCard({ entry }: { entry: DictionaryEntry }) {
+  return (
+    <div className="dict-card">
+      <p className="dict-head">
+        {entry.gender && <span className="dict-gender">{entry.gender}</span>}{" "}
+        <strong>{entry.word}</strong>
+        <span className="muted">
+          {" "}
+          · {entry.part_of_speech}
+          {entry.pronunciation ? ` · ${entry.pronunciation}` : ""}
+        </span>
+      </p>
+      {entry.forms.length > 0 && (
+        <ul className="dict-forms">
+          {entry.forms.map((f) => (
+            <li key={f.label}>
+              <span className="muted">{f.label}:</span> {f.form}
+            </li>
+          ))}
+        </ul>
+      )}
+      {entry.definitions.length > 0 && (
+        <p className="muted" style={{ margin: "0.4rem 0 0", fontSize: "0.9rem" }}>
+          {entry.definitions.join("; ")}
+        </p>
+      )}
+      {entry.source_url && (
+        <p className="dict-source muted">
+          <a href={entry.source_url} target="_blank" rel="noreferrer">
+            Wiktionary
+          </a>
+        </p>
       )}
     </div>
   );
