@@ -677,8 +677,14 @@ def _merge_dictionary_facts(card: CardSuggestion) -> CardSuggestion:
     return card
 
 
-def suggest_flashcard(german: str, target: str, english: str | None = None) -> CardSuggestion:
+def suggest_flashcard(
+    german: str,
+    target: str,
+    english: str | None = None,
+    sections: list[GrammarSection] | None = None,
+) -> CardSuggestion:
     """Propose a short sentence flashcard for a highlighted German word."""
+    catalogue = _index(sections) if sections else "(no grammar sections available)"
     system = (
         "You build German→English study flashcards for a learner reading a German book. "
         "They highlighted one target word in a sentence; make a clean card that drills it:\n"
@@ -701,12 +707,21 @@ def suggest_flashcard(german: str, target: str, english: str | None = None) -> C
         "- declension: for a noun fill gender ('der'/'die'/'das') and plural (the plural form, or '—' if none); "
         "for a verb fill the three principal parts — infinitive, preterite (3rd person singular, e.g. 'lief'), "
         "and perfect (3rd-person auxiliary + past participle, e.g. 'ist gelaufen'); leave the rest null.\n"
-        "- note: include ONE short Context Note (Markdown) ONLY when a genuinely instructive grammar point "
-        "applies to your sentence (a singular/plural mismatch with English, a zero article, a separable verb, "
-        "a tricky case). Otherwise return null. Do not pad.\n"
+        "- note: a short Context Note (Markdown) on the instructive grammar across the WHOLE sentence — not "
+        "only the target word. Cover the genuinely teachable features a learner would stumble on: the target's "
+        "own point AND anything else of note (a comparative/superlative like 'größer', an adjective ending, a "
+        "noun's case, a separable or reflexive verb, unusual word order, a singular/plural or article mismatch "
+        "with English). Keep it tight — a few sentences at most, skip the obvious, and return null only if the "
+        "sentence is wholly unremarkable.\n"
+        "- section_numbers: the decimal numbers of the grammar sections (from the Catalogue below) whose rules "
+        "explain the points in your note, most relevant first. Use ONLY numbers that appear in the Catalogue; "
+        "return an empty list if none apply.\n"
         "Keep everything accurate; the gender, plural and verb parts may be corrected from a dictionary afterwards."
     )
-    user = f"Source German sentence: {german}\nHighlighted target word: {target}"
+    user = (
+        f"Catalogue of grammar sections:\n\n{catalogue}\n\n---\n\n"
+        f"Source German sentence: {german}\nHighlighted target word: {target}"
+    )
     if english:
         user += f"\nThe book's English for the source: {english}"
 

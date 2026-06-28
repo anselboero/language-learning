@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 import type { CardDeclension, CardSuggestion } from "@/lib/api";
+import Markdown from "./Markdown";
+import SectionRefs from "./SectionRefs";
 
 // Wrap the first case-insensitive occurrence of `target` in `text` with a
 // highlight, leaving the rest verbatim. Falls back to plain text if the target
@@ -34,16 +36,21 @@ export function declensionLine(pos: string, lemma: string, d: CardDeclension): s
 
 // The card back: German sentence (target highlighted), the declension line, and
 // an optional grammar Context Note. Shared by the review screen and the editor.
-export function CardBack({ card }: { card: Pick<CardSuggestion, "german" | "target_de" | "pos" | "lemma" | "declension" | "note"> }) {
+export function CardBack({ card }: { card: Pick<CardSuggestion, "german" | "target_de" | "pos" | "lemma" | "declension" | "note" | "section_numbers"> }) {
   const line = declensionLine(card.pos, card.lemma, card.declension);
   return (
     <div className="card-back">
       <p className="card-sentence">{highlight(card.german, card.target_de)}</p>
       {line && <p className="card-declension">{line}</p>}
       {card.note && (
-        <p className="card-note">
-          <strong>Context Note:</strong> {card.note}
-        </p>
+        <div className="card-note">
+          <Markdown>{`**Context Note:** ${card.note}`}</Markdown>
+          {card.section_numbers.length > 0 && (
+            <p className="muted card-note-refs">
+              Grammar: <SectionRefs refs={card.section_numbers} />
+            </p>
+          )}
+        </div>
       )}
     </div>
   );

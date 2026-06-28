@@ -15,6 +15,7 @@ import {
   type TranslateResponse,
 } from "@/lib/api";
 import Markdown from "./Markdown";
+import CardFields from "./CardFields";
 
 // What the inspector acts on: a German word or phrase, the enclosing German
 // sentence used as context, and that sentence's English (for flashcards).
@@ -235,11 +236,6 @@ function CardDraftEditor({
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const set = <K extends keyof CardSuggestion>(key: K, value: CardSuggestion[K]) =>
-    setDraft({ ...draft, [key]: value });
-  const setDecl = (key: keyof CardSuggestion["declension"], value: string) =>
-    setDraft({ ...draft, declension: { ...draft.declension, [key]: value || null } });
-
   async function save() {
     setSaving(true);
     setError(null);
@@ -270,100 +266,7 @@ function CardDraftEditor({
     <div className="card-draft">
       <p className="card-draft-label">New flashcard</p>
 
-      <label className="card-field">
-        <span>Front (English)</span>
-        <input type="text" value={draft.english} onChange={(e) => set("english", e.target.value)} />
-      </label>
-      <label className="card-field">
-        <span>Back (German)</span>
-        <input type="text" value={draft.german} onChange={(e) => set("german", e.target.value)} />
-      </label>
-      <div className="card-field-row">
-        <label className="card-field">
-          <span>Highlight (EN)</span>
-          <input type="text" value={draft.target_en} onChange={(e) => set("target_en", e.target.value)} />
-        </label>
-        <label className="card-field">
-          <span>Highlight (DE)</span>
-          <input type="text" value={draft.target_de} onChange={(e) => set("target_de", e.target.value)} />
-        </label>
-      </div>
-
-      <div className="card-field-row">
-        <label className="card-field" style={{ flex: "0 0 7rem" }}>
-          <span>Type</span>
-          <select value={draft.pos} onChange={(e) => set("pos", e.target.value)}>
-            <option value="noun">noun</option>
-            <option value="verb">verb</option>
-            <option value="other">other</option>
-          </select>
-        </label>
-        <label className="card-field">
-          <span>Lemma</span>
-          <input type="text" value={draft.lemma} onChange={(e) => set("lemma", e.target.value)} />
-        </label>
-      </div>
-
-      {draft.pos === "noun" && (
-        <div className="card-field-row">
-          <label className="card-field" style={{ flex: "0 0 7rem" }}>
-            <span>Gender</span>
-            <select value={draft.declension.gender ?? ""} onChange={(e) => setDecl("gender", e.target.value)}>
-              <option value="">—</option>
-              <option value="der">der</option>
-              <option value="die">die</option>
-              <option value="das">das</option>
-            </select>
-          </label>
-          <label className="card-field">
-            <span>Plural</span>
-            <input
-              type="text"
-              value={draft.declension.plural ?? ""}
-              onChange={(e) => setDecl("plural", e.target.value)}
-            />
-          </label>
-        </div>
-      )}
-
-      {draft.pos === "verb" && (
-        <div className="card-field-row">
-          <label className="card-field">
-            <span>Infinitive</span>
-            <input
-              type="text"
-              value={draft.declension.infinitive ?? ""}
-              onChange={(e) => setDecl("infinitive", e.target.value)}
-            />
-          </label>
-          <label className="card-field">
-            <span>Präteritum</span>
-            <input
-              type="text"
-              value={draft.declension.preterite ?? ""}
-              onChange={(e) => setDecl("preterite", e.target.value)}
-            />
-          </label>
-          <label className="card-field">
-            <span>Perfekt</span>
-            <input
-              type="text"
-              value={draft.declension.perfect ?? ""}
-              onChange={(e) => setDecl("perfect", e.target.value)}
-            />
-          </label>
-        </div>
-      )}
-
-      <label className="card-field">
-        <span>Context Note (optional)</span>
-        <textarea
-          rows={3}
-          value={draft.note ?? ""}
-          onChange={(e) => set("note", e.target.value || null)}
-          placeholder="A short grammar note, if relevant"
-        />
-      </label>
+      <CardFields value={draft} onChange={setDraft} />
 
       {error && <p className="error" style={{ margin: "0.4rem 0 0" }}>{error}</p>}
 

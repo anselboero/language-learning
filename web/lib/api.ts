@@ -341,6 +341,16 @@ export async function createFlashcard(card: FlashcardData): Promise<Flashcard> {
   );
 }
 
+export async function updateFlashcard(id: number, card: FlashcardData): Promise<Flashcard> {
+  return unwrap(
+    await fetch(`${API_BASE}/flashcards/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(card),
+    }),
+  );
+}
+
 export async function listFlashcards(): Promise<Flashcard[]> {
   return unwrap(await fetch(`${API_BASE}/flashcards`, { cache: "no-store" }));
 }

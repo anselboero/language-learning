@@ -254,7 +254,7 @@ def delete_reading_book(book_id: int) -> dict[str, bool]:
 def generate_flashcard(req: CardSuggestRequest) -> CardSuggestion:
     """Propose an editable card for a highlighted word; nothing is persisted yet."""
     try:
-        return claude_client.suggest_flashcard(req.german, req.target, req.english)
+        return claude_client.suggest_flashcard(req.german, req.target, req.english, db.list_sections())
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Card generation failed: {exc}") from exc
 
@@ -272,6 +272,14 @@ def list_flashcards() -> list[Flashcard]:
 @app.get("/flashcards/due", response_model=list[Flashcard])
 def due_flashcards() -> list[Flashcard]:
     return db.list_due_flashcards(srs._today().isoformat())
+
+
+@app.put("/flashcards/{card_id}", response_model=Flashcard)
+def update_flashcard(card_id: int, card: FlashcardData) -> Flashcard:
+    updated = db.update_flashcard(card_id, card)
+    if not updated:
+        raise HTTPException(404, "Flashcard not found.")
+    return updated
 
 
 @app.post("/flashcards/{card_id}/review", response_model=Flashcard)

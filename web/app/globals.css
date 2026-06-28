@@ -461,6 +461,12 @@ button.ghost:hover {
   font-size: 0.95rem;
   margin: 0.8rem 0 0;
 }
+.card-note .markdown p {
+  margin: 0;
+}
+.card-note-refs {
+  margin: 0.4rem 0 0;
+}
 .review-input {
   width: 100%;
   margin-top: 0.5rem;
@@ -556,6 +562,23 @@ button.ghost:hover {
 }
 .manage-card-body {
   flex: 1;
+}
+.manage-card-toggle {
+  display: block;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  width: 100%;
+}
+.manage-card-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
 }
 .manage-meta {
   font-size: 0.8rem;

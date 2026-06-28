@@ -613,6 +613,36 @@ def review_flashcard(card_id: int, rating: str) -> Flashcard | None:
     return _row_to_flashcard(row)
 
 
+def update_flashcard(card_id: int, card: FlashcardData) -> Flashcard | None:
+    """Overwrite a card's editable content, leaving its SM-2 schedule untouched."""
+    with _connect() as conn:
+        cur = conn.execute(
+            """
+            UPDATE flashcards
+               SET book_id = ?, english = ?, german = ?, target_de = ?, target_en = ?,
+                   pos = ?, lemma = ?, declension = ?, note = ?, section_numbers = ?
+             WHERE id = ?
+            """,
+            (
+                card.book_id,
+                card.english,
+                card.german,
+                card.target_de,
+                card.target_en,
+                card.pos,
+                card.lemma,
+                json.dumps(card.declension.model_dump()),
+                card.note,
+                json.dumps(card.section_numbers),
+                card_id,
+            ),
+        )
+        if cur.rowcount == 0:
+            return None
+        row = conn.execute("SELECT * FROM flashcards WHERE id = ?", (card_id,)).fetchone()
+    return _row_to_flashcard(row)
+
+
 def delete_flashcard(card_id: int) -> bool:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM flashcards WHERE id = ?", (card_id,))

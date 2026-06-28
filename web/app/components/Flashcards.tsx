@@ -7,11 +7,14 @@ import {
   listDueFlashcards,
   listFlashcards,
   reviewFlashcard,
+  updateFlashcard,
   type AnswerCheck,
   type Flashcard,
+  type FlashcardData,
   type Rating,
 } from "@/lib/api";
 import { CardBack, highlight } from "./FlashcardFace";
+import CardFields from "./CardFields";
 import Markdown from "./Markdown";
 import SectionRefs from "./SectionRefs";
 
@@ -212,7 +215,7 @@ function diffWords(typed: string, correct: string): { word: string; ok: boolean 
   return words.map((word, k) => ({ word, ok: matched[k] }));
 }
 
-// --- manage: browse and delete the deck --------------------------------------
+// --- manage: browse, edit and delete the deck --------------------------------
 
 function Manage() {
   const [cards, setCards] = useState<Flashcard[] | null>(null);
@@ -220,6 +223,10 @@ function Manage() {
   useEffect(() => {
     listFlashcards().then(setCards).catch(() => setCards([]));
   }, []);
+
+  function replace(updated: Flashcard) {
+    setCards((c) => (c ?? []).map((x) => (x.id === updated.id ? updated : x)));
+  }
 
   async function remove(id: number) {
     await deleteFlashcard(id);
@@ -241,19 +248,95 @@ function Manage() {
     <>
       <p className="muted" style={{ marginTop: 0 }}>{cards.length} cards</p>
       {cards.map((card) => (
-        <div key={card.id} className="card manage-card">
-          <div className="manage-card-body">
-            <p style={{ margin: 0 }}>{highlight(card.english, card.target_en)}</p>
-            <p className="muted" style={{ margin: "0.2rem 0 0" }}>
-              {highlight(card.german, card.target_de)}
-            </p>
-            <p className="muted manage-meta">due {card.due}</p>
-          </div>
-          <button className="ghost" onClick={() => remove(card.id)} title="Delete card">
+        <ManageCard key={card.id} card={card} onSaved={replace} onDelete={() => remove(card.id)} />
+      ))}
+    </>
+  );
+}
+
+// One card in the Manage list: a summary that expands to the full front/back,
+// with an inline editor that saves content changes (the SM-2 schedule is kept).
+function ManageCard({
+  card,
+  onSaved,
+  onDelete,
+}: {
+  card: Flashcard;
+  onSaved: (c: Flashcard) => void;
+  onDelete: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<FlashcardData>(card);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function startEditing() {
+    setDraft(card);
+    setError(null);
+    setEditing(true);
+    setExpanded(true);
+  }
+
+  async function save() {
+    setSaving(true);
+    setError(null);
+    try {
+      onSaved(await updateFlashcard(card.id, draft));
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save the card.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (editing) {
+    return (
+      <div className="card manage-card-open">
+        <CardFields value={draft} onChange={(c) => setDraft({ ...c, book_id: draft.book_id })} />
+        {error && <p className="error" style={{ margin: "0.4rem 0 0" }}>{error}</p>}
+        <div className="card-draft-actions">
+          <button onClick={save} disabled={saving}>
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+          <button className="ghost" onClick={() => setEditing(false)} disabled={saving}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card manage-card-open">
+      <div className="manage-card">
+        <button
+          className="manage-card-body manage-card-toggle"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+        >
+          <span>{highlight(card.english, card.target_en)}</span>
+          <span className="muted" style={{ display: "block", margin: "0.2rem 0 0" }}>
+            {highlight(card.german, card.target_de)}
+          </span>
+          <span className="muted manage-meta">due {card.due}</span>
+        </button>
+        <div className="manage-card-actions">
+          <button className="ghost" onClick={startEditing} title="Edit card">
+            Edit
+          </button>
+          <button className="ghost" onClick={onDelete} title="Delete card">
             Delete
           </button>
         </div>
-      ))}
-    </>
+      </div>
+      {expanded && (
+        <div style={{ marginTop: "0.8rem" }}>
+          <hr className="card-rule" />
+          <CardBack card={card} />
+        </div>
+      )}
+    </div>
   );
 }

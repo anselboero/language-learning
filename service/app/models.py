@@ -418,10 +418,12 @@ class CardSuggestion(BaseModel):
     )
     note: Optional[str] = Field(
         default=None,
-        description="One short Context Note (Markdown) on a genuinely instructive grammar point, or null if none applies.",
+        description="A short Context Note (Markdown) on the instructive grammar across the whole sentence — "
+        "the target word and any other notable feature — or null if the sentence is wholly unremarkable.",
     )
     section_numbers: list[str] = Field(
-        default_factory=list, description="Grammar section numbers the note draws on, if any."
+        default_factory=list,
+        description="Decimal grammar section numbers (from the provided catalogue) whose rules explain the note.",
     )
 
 
